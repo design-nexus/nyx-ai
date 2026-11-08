@@ -22,6 +22,12 @@ pub struct Settings {
     /// Where coding tools reach the OpenAI-compatible API (loopback only); empty
     /// turns it off. `nyx-aid.socket` listens on the same address.
     pub openai_endpoint: String,
+    /// `auto` downloads newer revisions of cached models while idle on AC power,
+    /// `notify` only reports them, `off` doesn't check.
+    pub model_updates: String,
+    pub update_check_hours: u64,
+    /// Companion files downloads include: `mmproj`, `mtp`, `dflash`, `eagle3`, `dspark`.
+    pub sidecars: Vec<String>,
 }
 
 impl Default for Settings {
@@ -32,6 +38,9 @@ impl Default for Settings {
             model_dirs: vec!["~/.local/share/nyx-ai/models".into(), "~/.local/share/nyx-assistant/models".into()],
             worker: None,
             openai_endpoint: "127.0.0.1:8080".into(),
+            model_updates: "auto".into(),
+            update_check_hours: 24,
+            sidecars: vec!["mmproj".into(), "mtp".into()],
         }
     }
 }
@@ -77,6 +86,12 @@ impl Settings {
         if self.idle_unload_seconds < -1 {
             self.idle_unload_seconds = -1;
         }
+        if !matches!(self.model_updates.as_str(), "auto" | "notify" | "off") {
+            self.model_updates = "auto".into();
+        }
+        self.update_check_hours = self.update_check_hours.clamp(1, 24 * 30);
+        self.sidecars.retain(|k| crate::hf::SIDECARS.contains(&k.as_str()));
+        self.sidecars.dedup();
         self
     }
 
@@ -130,5 +145,10 @@ mod tests {
     fn clamps() {
         let s = Settings { max_loaded: 99, idle_unload_seconds: -7, ..Default::default() }.clamped();
         assert_eq!((s.max_loaded, s.idle_unload_seconds), (MAX_LOADED_LIMIT, -1));
+        let s = Settings { model_updates: "sometimes".into(), update_check_hours: 0, sidecars: vec!["mtp".into(), "x".into()], ..Default::default() }
+            .clamped();
+        assert_eq!((s.model_updates.as_str(), s.update_check_hours, s.sidecars.as_slice()), ("auto", 1, &["mtp".to_string()][..]));
+        let old: Settings = toml::from_str("max_loaded = 2\n").unwrap();
+        assert_eq!((old.model_updates.as_str(), old.sidecars.len()), ("auto", 2));
     }
 }

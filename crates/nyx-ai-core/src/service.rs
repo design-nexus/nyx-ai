@@ -10,6 +10,7 @@ use crate::registry::{Record, Registry, RouterItem};
 use crate::resources;
 use crate::scheduler::{Backend, Load, Scheduler};
 use crate::stream::{self, Sse};
+use crate::updates::Updates;
 use crate::worker::{self, Worker, encode_query};
 use futures_util::future::BoxFuture;
 use hyper::Method;
@@ -40,6 +41,12 @@ pub struct Options {
     pub allow_untrusted: bool,
     /// Use this llama-server instead of the configured or installed one.
     pub worker: Option<std::path::PathBuf>,
+    /// Where to read mains power from (`/sys/class/power_supply`).
+    pub power_supply: Option<std::path::PathBuf>,
+    /// Hugging Face's address, for tests (`HF_ENDPOINT` otherwise).
+    pub hf_endpoint: Option<String>,
+    /// How long a model must sit unused before an update switches it (120 s).
+    pub update_idle_secs: Option<u64>,
 }
 
 #[derive(Default)]
@@ -169,6 +176,11 @@ pub struct Service {
     router_status: Mutex<HashMap<String, String>>,
     seen_generation: AtomicU64,
     refresh_lock: tokio::sync::Mutex<()>,
+    updates: Updates,
+    /// When the updater last started each model's download.
+    update_tries: Mutex<HashMap<String, Instant>>,
+    switch_lock: tokio::sync::Mutex<()>,
+    started: Instant,
 }
 
 const PRIVILEGED: &[&str] = &["remove_model", "configure_model", "configure_service"];
@@ -202,13 +214,20 @@ impl Service {
         let scheduler = Scheduler::new(Arc::new(WorkerBackend(shared.clone())), settings.max_loaded, settings.idle_unload_seconds, metrics.clone());
         Arc::new_cyclic(|me: &Weak<Service>| {
             let on_done = me.clone();
-            let downloads = Downloads::new(paths.cache.clone(), paths.config_home.clone(), move || {
-                if let Some(service) = on_done.upgrade() {
-                    tokio::spawn(async move {
-                        let _ = service.refresh(true).await;
-                    });
-                }
-            });
+            let downloads = Downloads::new(
+                paths.cache.clone(),
+                options.hf_endpoint.clone().unwrap_or_else(crate::hf::endpoint),
+                paths.config_home.clone(),
+                settings.sidecars.clone(),
+                Box::new(move |model, revision| {
+                    let me = on_done.clone();
+                    Box::pin(async move {
+                        if let Some(service) = me.upgrade() {
+                            service.downloaded(&model, &revision).await;
+                        }
+                    })
+                }),
+            );
             let on_idle = me.clone();
             scheduler.on_idle(move |model| {
                 if let Some(service) = on_idle.upgrade() {
@@ -225,6 +244,10 @@ impl Service {
                 router_status: Mutex::new(HashMap::new()),
                 seen_generation: AtomicU64::new(0),
                 refresh_lock: tokio::sync::Mutex::new(()),
+                updates: Updates::default(),
+                update_tries: Mutex::new(HashMap::new()),
+                switch_lock: tokio::sync::Mutex::new(()),
+                started: Instant::now(),
             }
         })
     }
@@ -248,6 +271,8 @@ impl Service {
                         let total = resources::detect().ram;
                         let pressure = resources::under_pressure(total, resources::available_ram(), resources::memory_pressure());
                         me.scheduler.tick(pressure).await;
+                        me.apply_staged().await;
+                        me.auto_update();
                     }
                 }
             }
@@ -337,11 +362,12 @@ impl Service {
 
     fn model(&self, id: &str, record: &Record) -> Model {
         let meta = record.meta.as_ref();
+        let update = (record.source == Source::Cache && !record.missing).then(|| self.updates.get(id)).flatten().filter(|u| u.content);
         let view = self.scheduler.view(id);
         let router = self.router_status.lock().expect("status").get(id).cloned().unwrap_or_default();
         let state = if record.missing {
             ModelState::Missing
-        } else if self.downloads.active(id) || router == "downloading" {
+        } else if (self.downloads.active(id) || router == "downloading") && record.path.as_ref().is_none_or(|p| !p.exists()) {
             ModelState::Downloading
         } else {
             match view {
@@ -376,6 +402,8 @@ impl Service {
             removable: record.source == Source::Cache,
             pending_settings: view.is_some_and(|v| v.3),
             error: record.error.clone(),
+            update_available: update.is_some(),
+            update_size: update.map(|u| u.size),
         }
     }
 
@@ -401,6 +429,8 @@ impl Service {
                     removable: false,
                     pending_settings: false,
                     error: None,
+                    update_available: false,
+                    update_size: None,
                 });
             }
         }
@@ -468,6 +498,7 @@ impl Service {
             Op::WorkerStatus {} => Ok(Reply::Worker(self.worker_status())),
             Op::ListCapabilities {} => Ok(Reply::Capabilities(self.capabilities())),
             Op::ServiceSettings {} => Ok(Reply::Service(self.service_settings())),
+            Op::CheckUpdates {} => Ok(Reply::Models { models: self.check_updates().await }),
             Op::ConfigureService { max_loaded, idle_unload_seconds } => self.configure_service(max_loaded, idle_unload_seconds).map(Reply::Service),
         }
     }
@@ -805,6 +836,118 @@ impl Service {
         Ok(reply["prompt"].as_str().unwrap_or_default().to_string())
     }
 
+    // ---------- Model updates ----------
+
+    /// Cached models, by ID.
+    fn cache_models(&self) -> Vec<String> {
+        self.shared
+            .registry
+            .known()
+            .into_iter()
+            .filter(|(_, r)| r.source == Source::Cache && !r.missing && !r.draft)
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    /// Check Hugging Face now; returns the models with updates.
+    pub async fn check_updates(&self) -> Vec<Model> {
+        let token = crate::hf::token(&self.shared.paths.config_home);
+        let found = self
+            .updates
+            .check(&self.shared.paths.cache, self.downloads.endpoint(), token.as_deref(), self.downloads.sidecars(), &self.cache_models())
+            .await;
+        let content = found.values().filter(|u| u.content).count();
+        tracing::info!(updates = content, unchanged_files = found.len() - content, "checked models for updates");
+        self.list_models().await.into_iter().filter(|m| m.update_available).collect()
+    }
+
+    /// A download finished: stage its revision, and use it now if its models are free.
+    async fn downloaded(&self, model: &str, revision: &str) {
+        if let Ok((repo, _)) = crate::downloads::parse_model(model) {
+            self.updates.stage(&repo, revision);
+        }
+        self.apply_staged().await;
+    }
+
+    /// Put staged revisions in use where none of the repository's models is
+    /// busy or was used in the last two minutes.
+    pub async fn apply_staged(&self) {
+        let _one = self.switch_lock.lock().await;
+        let idle = self.options.update_idle_secs.unwrap_or(120);
+        for (repo, revision) in self.updates.staged() {
+            let prefix = format!("{repo}:");
+            let loaded: Vec<_> = self.scheduler.loaded_models().into_iter().filter(|m| m.id.starts_with(&prefix)).collect();
+            if loaded.iter().any(|m| m.active > 0 || m.state != "loaded" || m.idle_secs < idle) {
+                continue;
+            }
+            let mut free = true;
+            for m in &loaded {
+                free &= self.scheduler.unload_if_idle(&m.id).await.unwrap_or(false);
+            }
+            if !free {
+                continue;
+            }
+            match crate::downloads::switch_revision(&self.shared.paths.cache, &repo, &revision) {
+                Ok(()) => tracing::info!(%repo, %revision, "new revision in use"),
+                Err(e) => tracing::warn!(%repo, error = %e, "couldn't switch revisions"),
+            }
+            self.updates.switched(&repo);
+            if let Err(e) = self.refresh(true).await {
+                tracing::debug!(error = %e, "router not refreshed after an update");
+            }
+        }
+    }
+
+    /// Check on schedule, and in `auto` mode download updates while nothing runs
+    /// and the computer is on mains power.
+    pub fn auto_update(self: &Arc<Self>) {
+        let (mode, hours) = {
+            let s = self.settings.lock().expect("settings");
+            (s.model_updates.clone(), s.update_check_hours)
+        };
+        if mode == "off" {
+            return;
+        }
+        let due = match *self.updates.last_check.lock().expect("updates") {
+            None => self.started.elapsed() >= Duration::from_secs(300),
+            Some(at) => at.elapsed() >= Duration::from_secs(hours * 3600),
+        };
+        if due && !self.updates.checking.swap(true, Ordering::SeqCst) {
+            let me = self.clone();
+            tokio::spawn(async move {
+                me.check_updates().await;
+                me.updates.checking.store(false, Ordering::SeqCst);
+            });
+        }
+        if mode != "auto" {
+            return;
+        }
+        let power = self.options.power_supply.clone().unwrap_or_else(|| "/sys/class/power_supply".into());
+        let busy = self.metrics.active.load(Ordering::Relaxed) > 0;
+        if busy || !crate::updates::on_ac(&power) {
+            let paused = self.downloads.pause_auto();
+            if !paused.is_empty() {
+                tracing::info!(models = ?paused, busy, "updates paused");
+                let mut tries = self.update_tries.lock().expect("tries");
+                for model in paused {
+                    tries.remove(&model);
+                }
+            }
+            return;
+        }
+        for (model, update) in self.updates.found() {
+            let Ok((repo, _)) = crate::downloads::parse_model(&model) else { continue };
+            let recent = self.update_tries.lock().expect("tries").get(&model).is_some_and(|t| t.elapsed() < Duration::from_secs(3600));
+            if self.updates.is_staged(&repo) || self.downloads.active(&model) || recent {
+                continue;
+            }
+            if self.downloads.start_auto(&model).is_ok() {
+                self.update_tries.lock().expect("tries").insert(model.clone(), Instant::now());
+                tracing::info!(%model, bytes = update.size, files_changed = update.content, "updating");
+            }
+        }
+    }
+
     // ---------- The OpenAI-compatible endpoint ----------
 
     pub fn openai_addr(&self) -> Option<std::net::SocketAddr> {
@@ -895,6 +1038,7 @@ impl Service {
             idle_unload_seconds: s.idle_unload_seconds,
             model_dirs: s.model_dirs.clone(),
             openai_endpoint: s.openai_addr().map(|a| a.to_string()),
+            model_updates: Some(s.model_updates.clone()),
         }
     }
 

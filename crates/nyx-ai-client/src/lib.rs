@@ -178,6 +178,14 @@ impl Client {
         expect_ok(self.call(Op::CancelDownload { model: model.into() }).await?)
     }
 
+    /// Check Hugging Face now; returns the models with updates.
+    pub async fn check_updates(&self) -> Result<Vec<Model>> {
+        match self.call(Op::CheckUpdates {}).await? {
+            Reply::Models { models } => Ok(models),
+            other => Err(unexpected(&other)),
+        }
+    }
+
     pub async fn downloads(&self) -> Result<Vec<Download>> {
         match self.call(Op::Downloads {}).await? {
             Reply::Downloads { downloads } => Ok(downloads),

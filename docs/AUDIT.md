@@ -67,10 +67,9 @@ companion files (`mmproj`, `dflash`, `drafter`).
   per pass (300 s cap) and pauses on battery or heat.
 - **Stays in Glimpse:** the SQLite index, ranking, extraction, plugins and UI.
 
-To move later (Handoff 05): text and multimodal embeddings. The Prism build
-AI Core runs can't load EmbeddingGemma 2 yet (`gemma-embedding2` is newer than
-`prism-b10826`), and multimodal embeddings through the router are not verified;
-see `PRISM.md`.
+To move later (Handoff 05): text and multimodal embeddings. The first Prism
+pin (`prism-b10826`) couldn't load EmbeddingGemma 2; `prism-b12128` can. Multimodal
+embeddings through the router are not verified; see `PRISM.md`.
 
 ## Nyx Assistant (`nyx-assistant/apps/assistant`)
 

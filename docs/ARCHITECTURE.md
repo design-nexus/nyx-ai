@@ -83,7 +83,11 @@ unloaded mid-reply). Closing the connection cancels the request. Like the old
 - `presets`: `~/.config/nyx-ai/models.ini`, the load-time settings per model
   (validated keys only; other keys are preserved).
 - `downloads`: Hugging Face GGUF downloads into the shared HF hub cache with
-  resume, SHA-256 checks, disk-space checks and one-at-a-time queueing.
+  resume, SHA-256 checks, disk-space checks and one-at-a-time queueing, plus
+  companions (projector, MTP head). A download stages a revision; switching
+  `refs/main` keeps other quants' files and prunes blobs nothing links to.
+- `updates`: compares cached models with their repository's newest revision
+  and, in `auto` mode, updates them while idle on mains power.
 - `resources`: RAM and VRAM, GPU backends present in the worker, memory
   pressure, and the memory a model needs.
 - `scheduler`: leases, priority queues with aging, per-model concurrency,

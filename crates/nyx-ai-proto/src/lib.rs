@@ -141,6 +141,8 @@ pub enum Op {
     WorkerStatus {},
     ListCapabilities {},
     ServiceSettings {},
+    /// Check Hugging Face for newer revisions of cached models now.
+    CheckUpdates {},
     ConfigureService {
         #[serde(default)]
         max_loaded: Option<u32>,
@@ -170,6 +172,7 @@ pub const OPERATIONS: &[&str] = &[
     "list_capabilities",
     "service_settings",
     "configure_service",
+    "check_updates",
 ];
 
 impl Op {
@@ -193,6 +196,7 @@ impl Op {
             Op::WorkerStatus {} => "worker_status",
             Op::ListCapabilities {} => "list_capabilities",
             Op::ServiceSettings {} => "service_settings",
+            Op::CheckUpdates {} => "check_updates",
             Op::ConfigureService { .. } => "configure_service",
         }
     }
@@ -607,6 +611,12 @@ pub struct Model {
     pub pending_settings: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Hugging Face has a newer revision with different files or new companions.
+    #[serde(default)]
+    pub update_available: bool,
+    /// Bytes the update downloads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_size: Option<u64>,
 }
 
 impl Model {
@@ -810,6 +820,9 @@ pub struct ServiceSettings {
     /// The OpenAI-compatible endpoint for coding tools, when it's on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openai_endpoint: Option<String>,
+    /// `auto`, `notify` or `off`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_updates: Option<String>,
 }
 
 // ---------- Errors ----------
@@ -899,6 +912,7 @@ mod tests {
             }),
             Op::Embed { model: "e".into(), input: vec!["a".into()], priority: Priority::Background },
             Op::ConfigureService { max_loaded: Some(2), idle_unload_seconds: None },
+            Op::CheckUpdates {},
         ];
         for op in ops {
             assert!(OPERATIONS.contains(&op.name()));

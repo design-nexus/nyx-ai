@@ -3,10 +3,33 @@
 
 use std::path::{Component, Path, PathBuf};
 
-/// Projectors and speculative drafters are companion files, not models to chat with.
-pub fn auxiliary_gguf(path: &str) -> bool {
+/// The kind of companion a file is (`mmproj`, `mtp`, `dflash`, `eagle3`,
+/// `dspark`), if it isn't a model of its own.
+pub fn sidecar_kind(path: &str) -> Option<&'static str> {
     let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
-    name.contains("mmproj") || name.contains("dflash") || name.contains("drafter")
+    let stem = name.strip_suffix(".gguf").unwrap_or(&name);
+    let tokens: Vec<&str> = stem.split(['-', '_', '.']).collect();
+    if name.contains("mmproj") {
+        Some("mmproj")
+    } else if name.contains("dflash") || name.contains("drafter") {
+        Some("dflash")
+    } else if tokens.contains(&"mtp") {
+        Some("mtp")
+    } else if tokens.contains(&"eagle3") {
+        Some("eagle3")
+    } else if tokens.contains(&"dspark") {
+        Some("dspark")
+    } else {
+        None
+    }
+}
+
+pub const SIDECARS: &[&str] = &["mmproj", "mtp", "dflash", "eagle3", "dspark"];
+
+/// Projectors, MTP heads and speculative drafters are companion files, not
+/// models to chat with.
+pub fn auxiliary_gguf(path: &str) -> bool {
+    sidecar_kind(path).is_some()
 }
 
 pub fn valid_repo(repo: &str) -> bool {
@@ -73,7 +96,7 @@ pub fn cached_auxiliary_model(cache: &Path, model: &str) -> bool {
 
 /// The tag llama.cpp's router gives a cached file: its last `-` part, after any
 /// `.` (`gemma-4-E4B_q4_0-it.gguf` is `IT`, `codec.decoder.f16.gguf` is `F16`).
-fn router_tag(name: &str) -> String {
+pub fn router_tag(name: &str) -> String {
     let stem = name.strip_suffix(".gguf").unwrap_or(name);
     let last = stem.rsplit('-').next().unwrap_or(stem);
     last.rsplit('.').next().unwrap_or(last).to_ascii_uppercase()
@@ -240,6 +263,10 @@ mod tests {
         assert_eq!(quant_tag("Ternary-Bonsai-2-27B-PQ2_0.gguf"), "PQ2_0");
         assert_eq!(quant_tag("Ternary-Bonsai-2-27B-PTQ1_0.gguf"), "PTQ1_0");
         assert!(auxiliary_gguf("Ternary-Bonsai-2-9B-DFlash2-Q8_0.gguf"));
+        assert_eq!(sidecar_kind("Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf"), Some("mtp"));
+        assert_eq!(sidecar_kind("Swift-IQ3_S-mtp.gguf"), Some("mtp"));
+        assert_eq!(sidecar_kind("gemma-4-E4B-it-mmproj.gguf"), Some("mmproj"));
+        assert_eq!(sidecar_kind("smtpserver-Q4_0.gguf"), None);
         assert_eq!(quant_tag("Q8_0/big-Q8_0-00001-of-00002.gguf"), "Q8_0");
     }
 

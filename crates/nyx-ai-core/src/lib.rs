@@ -14,4 +14,7 @@ pub mod scheduler;
 pub mod server;
 pub mod service;
 pub mod stream;
+#[cfg(test)]
+pub(crate) mod testhub;
+pub mod updates;
 pub mod worker;

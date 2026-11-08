@@ -72,18 +72,34 @@ struct Harness {
 
 impl Harness {
     async fn start() -> Harness {
+        Harness::start_with("", None, None).await
+    }
+
+    /// `settings`: extra lines for settings.toml; `hub`: a fake Hugging Face;
+    /// `power`: a fake /sys/class/power_supply.
+    async fn start_with(settings: &str, hub: Option<String>, power: Option<std::path::PathBuf>) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::under(dir.path());
         let folder = dir.path().join("models");
         std::fs::create_dir_all(&folder).unwrap();
         std::fs::write(folder.join("local-chat-Q8_0.gguf"), chat_file()).unwrap();
         std::fs::create_dir_all(&paths.config).unwrap();
-        std::fs::write(paths.settings(), format!("max_loaded = 1\nidle_unload_seconds = -1\nmodel_dirs = [{:?}]\n", folder.display().to_string())).unwrap();
+        std::fs::write(
+            paths.settings(),
+            format!("max_loaded = 1\nidle_unload_seconds = -1\nmodel_dirs = [{:?}]\n{settings}", folder.display().to_string()),
+        )
+        .unwrap();
         cached(&paths, "org/chat", "chat-Q4_K_M.gguf", &chat_file());
         cached(&paths, "org/embed", "embed-Q8_0.gguf", &embed_file());
         cached(&paths, "org/other", "other-Q4_K_M.gguf", &chat_file());
         cached(&paths, "org/broken", "broken-Q4_K_M.gguf", &chat_file());
-        let options = Options { allow_untrusted: false, worker: Some(env!("CARGO_BIN_EXE_nyx-ai-stub-worker").into()) };
+        let options = Options {
+            allow_untrusted: false,
+            worker: Some(env!("CARGO_BIN_EXE_nyx-ai-stub-worker").into()),
+            power_supply: power,
+            hf_endpoint: hub,
+            update_idle_secs: Some(0),
+        };
         let listener = nyx_ai_core::server::listen(&paths.socket).unwrap().unix;
         let service = Service::new(paths.clone(), options);
         let stop = CancellationToken::new();
@@ -297,6 +313,93 @@ async fn openai_endpoint_for_coding_tools() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(idle, "a dropped request kept its slot");
+    h.stop().await;
+}
+
+#[path = "../src/testhub.rs"]
+mod testhub;
+
+async fn finish(stream: nyx_ai_client::Result<nyx_ai_client::Stream>) {
+    let mut stream = stream.unwrap();
+    while let Some(item) = stream.next().await {
+        if let Item::Done(_) = item.unwrap() {
+            return;
+        }
+    }
+    panic!("no result");
+}
+
+fn revision(paths: &Paths) -> String {
+    std::fs::read_to_string(paths.cache.join("models--o--r/refs/main")).unwrap_or_default()
+}
+
+fn power(dir: &Path, mains: bool) {
+    for (name, kind, online) in [("BAT0", "Battery", "0"), ("AC", "Mains", if mains { "1" } else { "0" })] {
+        std::fs::create_dir_all(dir.join(name)).unwrap();
+        std::fs::write(dir.join(name).join("type"), kind).unwrap();
+        std::fs::write(dir.join(name).join("online"), online).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn updates_wait_for_a_free_model_and_for_mains_power() {
+    let (endpoint, hub) = testhub::fake_hub().await;
+    let (v1, mut v2, mut v3) = (chat_file(), chat_file(), chat_file());
+    v2.extend(b"two");
+    v3.extend(b"three!");
+    hub.set("a", &[("m-Q4_0.gguf", &v1)]);
+    let supply = tempfile::tempdir().unwrap();
+    power(supply.path(), false);
+    let h = Harness::start_with("model_updates = \"auto\"\n", Some(endpoint), Some(supply.path().into())).await;
+
+    finish(h.client.download_model("o/r:Q4_0").await).await;
+    assert_eq!(revision(&h.paths), "a".repeat(40));
+    assert!(h.client.list_models().await.unwrap().iter().any(|m| m.id == "o/r:Q4_0" && m.has(nyx_ai_client::proto::Capability::Chat)));
+    assert!(h.client.check_updates().await.unwrap().is_empty());
+
+    hub.set("b", &[("m-Q4_0.gguf", &v2)]);
+    let found = h.client.check_updates().await.unwrap();
+    assert_eq!(found.iter().map(|m| (m.id.as_str(), m.update_size)).collect::<Vec<_>>(), [("o/r:Q4_0", Some(v2.len() as u64))]);
+
+    // On battery the updater waits.
+    h.service.auto_update();
+    assert!(h.client.downloads().await.unwrap().iter().all(|d| d.model != "o/r:Q4_0" || d.state != nyx_ai_client::proto::DownloadState::Running));
+
+    // A chat holds the model; an update fetched meanwhile waits for it.
+    let mut chat = h.client.chat(ask("o/r:Q4_0", "count:300")).await.unwrap();
+    while !matches!(chat.next().await.unwrap().unwrap(), Item::Event(Event::Delta { .. })) {}
+    finish(h.client.download_model("o/r:Q4_0").await).await;
+    assert_eq!(revision(&h.paths), "a".repeat(40), "switched under a running chat");
+    drop(chat);
+    for _ in 0..50 {
+        if h.client.resource_status().await.unwrap().loaded.iter().all(|m| m.active == 0) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    h.service.apply_staged().await;
+    assert_eq!(revision(&h.paths), "b".repeat(40));
+    let file = h.paths.cache.join("models--o--r/snapshots").join("b".repeat(40)).join("m-Q4_0.gguf");
+    assert_eq!(std::fs::read(file).unwrap(), v2);
+    assert!(!h.client.list_models().await.unwrap().iter().any(|m| m.update_available));
+
+    // On mains power and idle, the updater fetches and switches by itself.
+    power(supply.path(), true);
+    hub.set("c", &[("m-Q4_0.gguf", &v3)]);
+    assert_eq!(h.client.check_updates().await.unwrap().len(), 1);
+    h.service.auto_update();
+    let mut switched = false;
+    for _ in 0..100 {
+        h.service.apply_staged().await;
+        if revision(&h.paths) == "c".repeat(40) {
+            switched = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(switched, "the automatic update didn't land");
+    let blobs = std::fs::read_dir(h.paths.cache.join("models--o--r/blobs")).unwrap().count();
+    assert_eq!(blobs, 1, "replaced revisions are pruned");
     h.stop().await;
 }
 

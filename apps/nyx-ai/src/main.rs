@@ -13,7 +13,8 @@ const USAGE: &str = "Usage: nyx-ai COMMAND [--json]
   status                       the worker, memory and loaded models
   models                       installed models
   info MODEL                   one model in detail
-  pull ORG/REPO:QUANT          download from Hugging Face
+  pull ORG/REPO:QUANT          download from Hugging Face (or update to its newest revision)
+  updates                      check Hugging Face for newer revisions now
   cancel-pull MODEL            stop a download
   rm MODEL                     delete a model from the shared cache
   load MODEL [--keep]          load now (--keep: until unload)
@@ -110,8 +111,12 @@ async fn run(client: &Client, args: &[String], json: bool, keep: bool, think: bo
             }
             for m in models {
                 let caps: Vec<String> = m.capabilities.iter().map(|c| format!("{c:?}").to_lowercase()).collect();
+                let update = match m.update_size {
+                    Some(size) if m.update_available => format!("  [update: {}]", gb(size)),
+                    _ => String::new(),
+                };
                 println!(
-                    "{:<10} {:<60} {:>8}  {}{}",
+                    "{:<10} {:<60} {:>8}  {}{}{update}",
                     format!("{:?}", m.state).to_lowercase(),
                     m.id,
                     gb(m.size),
@@ -153,6 +158,20 @@ async fn run(client: &Client, args: &[String], json: bool, keep: bool, think: bo
                     }
                     _ => {}
                 }
+            }
+        }
+        "updates" => {
+            let models = client.check_updates().await?;
+            if json {
+                print_json(&models);
+            } else if models.is_empty() {
+                println!("Every cached model is on its newest revision.");
+            } else {
+                for m in models {
+                    println!("{}  {} to download", m.id, gb(m.update_size.unwrap_or(0)));
+                }
+                let mode = client.service_settings().await?.model_updates.unwrap_or_default();
+                println!("{}", if mode == "auto" { "They download when the computer is idle and on mains power." } else { "Run nyx-ai pull MODEL to update." });
             }
         }
         "cancel-pull" => client.cancel_download(need(args, 1, "MODEL")?).await?,
@@ -198,6 +217,7 @@ async fn run(client: &Client, args: &[String], json: bool, keep: bool, think: bo
                 print_json(&s);
             } else {
                 println!("max_loaded = {}\nidle_unload_seconds = {}\nmodel_dirs = {}", s.max_loaded, s.idle_unload_seconds, s.model_dirs.join(", "));
+                println!("model_updates = {}", s.model_updates.as_deref().unwrap_or("auto"));
                 match &s.openai_endpoint {
                     Some(addr) => println!("openai_endpoint = {addr} (base URL http://{addr}/v1)"),
                     None => println!("openai_endpoint = off"),

@@ -8,6 +8,8 @@ use nyx_ai_proto::{Download, DownloadState, Error, ErrorKind};
 use reqwest::header::RANGE;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use futures_util::future::BoxFuture;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -31,15 +33,23 @@ pub struct File {
     pub lfs: Option<Lfs>,
 }
 
-/// The files one quant needs: its parts and the folder's projector (Q8_0
-/// preferred).
-pub fn selected_files(tree: &[File], quant: &str) -> Result<Vec<File>, String> {
+/// The files one quant needs: its parts, and the companions in `sidecars` that
+/// the repository has for it: the folder's projector, the quant's MTP head,
+/// and drafters (Q8_0 preferred, then the smallest).
+pub fn selected_files(tree: &[File], quant: &str, sidecars: &[String]) -> Result<Vec<File>, String> {
     let gguf = |f: &&File| f.path.to_ascii_lowercase().ends_with(".gguf");
     let first = tree
         .iter()
         .filter(gguf)
         .filter(|f| !hf::auxiliary_gguf(&f.path) && hf::quant_tag(&f.path) == quant)
         .min_by_key(|f| f.path.len())
+        // The router names some files by their last part (`gemma-4-E4B_q4_0-it.gguf` is `IT`).
+        .or_else(|| {
+            tree.iter()
+                .filter(gguf)
+                .filter(|f| !hf::auxiliary_gguf(&f.path) && hf::router_tag(f.path.rsplit('/').next().unwrap_or(&f.path)) == quant)
+                .min_by_key(|f| f.path.len())
+        })
         .ok_or_else(|| {
             if tree.iter().any(|f| hf::auxiliary_gguf(&f.path) && hf::quant_tag(&f.path) == quant) {
                 format!("{quant} is only a companion drafter or projector in this repository; choose a main model quantization")
@@ -55,13 +65,20 @@ pub fn selected_files(tree: &[File], quant: &str) -> Result<Vec<File>, String> {
     } else {
         vec![first.clone()]
     };
-    if let Some(projector) = tree
-        .iter()
-        .filter(gguf)
-        .filter(|f| f.path.to_ascii_lowercase().contains("mmproj") && Path::new(&f.path).parent() == Path::new(&first.path).parent())
-        .min_by_key(|f| (hf::quant_tag(&f.path) != "Q8_0", f.size))
-    {
-        files.push(projector.clone());
+    let folder = Path::new(&first.path).parent();
+    let stem = first.path.rsplit('/').next().unwrap_or(&first.path).trim_end_matches(".gguf").to_ascii_lowercase();
+    let stem = stem.split("-00001-of-").next().unwrap_or(&stem).to_string();
+    for kind in sidecars {
+        let pick = tree
+            .iter()
+            .filter(gguf)
+            .filter(|f| Path::new(&f.path).parent() == folder && hf::sidecar_kind(&f.path) == Some(kind.as_str()))
+            // An MTP head belongs to one quant: its name starts with the model's.
+            .filter(|f| kind != "mtp" || f.path.rsplit('/').next().unwrap_or(&f.path).to_ascii_lowercase().starts_with(&stem))
+            .min_by_key(|f| (hf::quant_tag(&f.path) != "Q8_0", f.size));
+        if let Some(file) = pick {
+            files.push(file.clone());
+        }
     }
     if files.iter().any(|f| !valid_file(&f.path) || f.lfs.as_ref().is_none_or(|l| !valid_oid(&l.oid))) {
         return Err("the repository has an invalid GGUF file path or checksum".into());
@@ -234,18 +251,18 @@ async fn download_file(job: &Job<'_>, file: &File, completed: &mut u64, progress
     Ok(())
 }
 
-/// Download one model into `cache` from `endpoint` (Hugging Face).
-pub async fn download(cache: &Path, endpoint: &str, token: Option<&str>, model: &str, tx: &watch::Sender<Download>) -> Result<(), Error> {
-    let (repo, quant) = parse_model(model)?;
-    let client = reqwest::Client::builder()
+pub fn client() -> Result<reqwest::Client, Error> {
+    reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
         .user_agent(concat!("nyx-ai/", env!("CARGO_PKG_VERSION")))
         .build()
-        .map_err(failed("HTTP client"))?;
-    let mut progress = Progress { tx, last: Instant::now() };
-    progress.set("Looking up the model", 0, 0, true);
-    let encoded = hf::encode_path(&repo);
-    let info: RepoInfo = fetch(&client, token, format!("{endpoint}/api/models/{encoded}"))
+        .map_err(failed("HTTP client"))
+}
+
+/// A repository's newest revision and its files.
+pub async fn latest(client: &reqwest::Client, endpoint: &str, token: Option<&str>, repo: &str) -> Result<(String, Vec<File>), Error> {
+    let encoded = hf::encode_path(repo);
+    let info: RepoInfo = fetch(client, token, format!("{endpoint}/api/models/{encoded}"))
         .send()
         .await
         .and_then(|r| r.error_for_status())
@@ -256,7 +273,7 @@ pub async fn download(cache: &Path, endpoint: &str, token: Option<&str>, model: 
     if info.sha.len() != 40 || !info.sha.bytes().all(|c| c.is_ascii_hexdigit()) {
         return Err(Error::new(ErrorKind::DownloadFailed, "Hugging Face returned an invalid revision"));
     }
-    let tree: Vec<File> = fetch(&client, token, format!("{endpoint}/api/models/{encoded}/tree/{}?recursive=true", info.sha))
+    let tree: Vec<File> = fetch(client, token, format!("{endpoint}/api/models/{encoded}/tree/{}?recursive=true", info.sha))
         .send()
         .await
         .and_then(|r| r.error_for_status())
@@ -264,7 +281,26 @@ pub async fn download(cache: &Path, endpoint: &str, token: Option<&str>, model: 
         .json()
         .await
         .map_err(failed("Hugging Face file list"))?;
-    let files = selected_files(&tree, &quant).map_err(|e| Error::new(ErrorKind::DownloadFailed, e))?;
+    Ok((info.sha, tree))
+}
+
+/// Download one model's files at the repository's newest revision into `cache`,
+/// with its snapshot links. Returns the revision; `switch_revision` makes it
+/// the one in use.
+pub async fn download(
+    cache: &Path,
+    endpoint: &str,
+    token: Option<&str>,
+    model: &str,
+    sidecars: &[String],
+    tx: &watch::Sender<Download>,
+) -> Result<String, Error> {
+    let (repo, quant) = parse_model(model)?;
+    let client = client()?;
+    let mut progress = Progress { tx, last: Instant::now() };
+    progress.set("Looking up the model", 0, 0, true);
+    let (sha, tree) = latest(&client, endpoint, token, &repo).await?;
+    let files = selected_files(&tree, &quant, sidecars).map_err(|e| Error::new(ErrorKind::DownloadFailed, e))?;
     let total: u64 = files.iter().map(|f| f.size).sum();
     let base = repo_dir(cache, &repo);
     let present: u64 = files
@@ -286,41 +322,144 @@ pub async fn download(cache: &Path, endpoint: &str, token: Option<&str>, model: 
         ));
     }
     let mut completed = 0;
-    let job = Job { endpoint, client: &client, token, repo: &repo, revision: &info.sha, base: &base, total };
+    let job = Job { endpoint, client: &client, token, repo: &repo, revision: &sha, base: &base, total };
     for file in &files {
         download_file(&job, file, &mut completed, &mut progress).await?;
     }
-    tokio::fs::create_dir_all(base.join("refs")).await.map_err(|e| Error::new(ErrorKind::DownloadFailed, e.to_string()))?;
-    tokio::fs::write(base.join("refs/main"), &info.sha).await.map_err(|e| Error::new(ErrorKind::DownloadFailed, e.to_string()))?;
-    progress.set("Done", total, total, true);
+    progress.set("Downloaded", total, total, true);
+    Ok(sha)
+}
+
+/// The revision `refs/main` names.
+pub fn current_revision(cache: &Path, repo: &str) -> Option<String> {
+    let text = std::fs::read_to_string(repo_dir(cache, repo).join("refs/main")).ok()?;
+    Some(text.trim().to_string()).filter(|r| !r.is_empty())
+}
+
+/// Every file in a snapshot and the blob (oid) it links to.
+pub fn snapshot_links(cache: &Path, repo: &str, revision: &str) -> BTreeMap<String, String> {
+    let root = repo_dir(cache, repo).join("snapshots").join(revision);
+    let mut out = BTreeMap::new();
+    let mut dirs = vec![root.clone()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if let Ok(target) = std::fs::read_link(&path) {
+                let oid = target.file_name().unwrap_or_default().to_string_lossy().into_owned();
+                out.insert(path.strip_prefix(&root).unwrap_or(&path).display().to_string(), oid);
+            } else if path.is_dir() {
+                dirs.push(path);
+            }
+        }
+    }
+    out
+}
+
+/// Make `revision` the one in use: link everything else the old snapshot had
+/// (other quants stay), point `refs/main` at it, drop the old snapshot, and
+/// delete blobs no snapshot links to any more.
+pub fn switch_revision(cache: &Path, repo: &str, revision: &str) -> std::io::Result<()> {
+    let base = repo_dir(cache, repo);
+    let new = base.join("snapshots").join(revision);
+    if !new.is_dir() {
+        return Err(std::io::Error::other(format!("{repo} has no snapshot {revision}")));
+    }
+    let old = current_revision(cache, repo);
+    if old.as_deref() == Some(revision) {
+        return Ok(());
+    }
+    if let Some(old) = &old {
+        let old_root = base.join("snapshots").join(old);
+        for (rel, _) in snapshot_links(cache, repo, old) {
+            let target = std::fs::read_link(old_root.join(&rel))?;
+            let link = new.join(&rel);
+            if std::fs::symlink_metadata(&link).is_err() {
+                if let Some(parent) = link.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::os::unix::fs::symlink(target, link)?;
+            }
+        }
+    }
+    crate::paths::write_atomic(&base.join("refs/main"), revision.as_bytes())?;
+    if let Some(old) = old {
+        let _ = std::fs::remove_dir_all(base.join("snapshots").join(old));
+    }
+    prune(cache, repo);
     Ok(())
+}
+
+/// Delete whole blobs no snapshot of the repository links to.
+pub fn prune(cache: &Path, repo: &str) -> u64 {
+    let base = repo_dir(cache, repo);
+    let mut used = std::collections::BTreeSet::new();
+    for snapshot in std::fs::read_dir(base.join("snapshots")).into_iter().flatten().flatten() {
+        let name = snapshot.file_name().to_string_lossy().into_owned();
+        used.extend(snapshot_links(cache, repo, &name).into_values());
+    }
+    let mut freed = 0;
+    for blob in std::fs::read_dir(base.join("blobs")).into_iter().flatten().flatten() {
+        let name = blob.file_name().to_string_lossy().into_owned();
+        if name.ends_with(".incomplete") || used.contains(&name) {
+            continue;
+        }
+        let size = blob.metadata().map(|m| m.len()).unwrap_or(0);
+        if std::fs::remove_file(blob.path()).is_ok() {
+            freed += size;
+        }
+    }
+    freed
 }
 
 struct Entry {
     tx: watch::Sender<Download>,
     abort: Option<tokio::task::AbortHandle>,
+    /// Started by the updater, which may pause it.
+    auto: bool,
 }
 
-/// The queue. `on_done` runs after each successful download (to refresh the
-/// model list).
+/// Runs after each download with `(model, revision)`, to put the revision in use.
+pub type OnDone = Box<dyn Fn(String, String) -> BoxFuture<'static, ()> + Send + Sync>;
+
+/// The queue.
 pub struct Downloads {
     cache: PathBuf,
     endpoint: String,
     config_home: PathBuf,
+    sidecars: Vec<String>,
     entries: Mutex<Vec<Entry>>,
-    on_done: Box<dyn Fn() + Send + Sync>,
+    on_done: OnDone,
 }
 
 impl Downloads {
-    pub fn new(cache: PathBuf, config_home: PathBuf, on_done: impl Fn() + Send + Sync + 'static) -> Arc<Downloads> {
-        Arc::new(Downloads { cache, endpoint: hf::endpoint(), config_home, entries: Mutex::new(Vec::new()), on_done: Box::new(on_done) })
+    /// `endpoint`: Hugging Face's address (`hf::endpoint()`).
+    pub fn new(cache: PathBuf, endpoint: String, config_home: PathBuf, sidecars: Vec<String>, on_done: OnDone) -> Arc<Downloads> {
+        Arc::new(Downloads { cache, endpoint, config_home, sidecars, entries: Mutex::new(Vec::new()), on_done })
+    }
+
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    pub fn sidecars(&self) -> &[String] {
+        &self.sidecars
     }
 
     /// Queue a download (or join the one already going) and watch it.
     pub fn start(self: &Arc<Self>, model: &str) -> Result<watch::Receiver<Download>, Error> {
+        self.queue(model, false)
+    }
+
+    /// Queue an update the updater may pause.
+    pub fn start_auto(self: &Arc<Self>, model: &str) -> Result<watch::Receiver<Download>, Error> {
+        self.queue(model, true)
+    }
+
+    fn queue(self: &Arc<Self>, model: &str, auto: bool) -> Result<watch::Receiver<Download>, Error> {
         parse_model(model)?;
         let mut entries = self.entries.lock().expect("downloads");
-        if let Some(e) = entries.iter().find(|e| e.tx.borrow().model == model && active(e.tx.borrow().state)) {
+        if let Some(e) = entries.iter_mut().find(|e| e.tx.borrow().model == model && active(e.tx.borrow().state)) {
+            e.auto &= auto;
             return Ok(e.tx.subscribe());
         }
         entries.retain(|e| e.tx.borrow().model != model);
@@ -332,10 +471,26 @@ impl Downloads {
             total: 0,
             error: None,
         });
-        entries.push(Entry { tx, abort: None });
+        entries.push(Entry { tx, abort: None, auto });
         drop(entries);
         self.pump();
         Ok(rx)
+    }
+
+    /// Stop the updater's downloads; their partial files stay for next time.
+    pub fn pause_auto(self: &Arc<Self>) -> Vec<String> {
+        let models: Vec<String> = self
+            .entries
+            .lock()
+            .expect("downloads")
+            .iter()
+            .filter(|e| e.auto && active(e.tx.borrow().state))
+            .map(|e| e.tx.borrow().model.clone())
+            .collect();
+        for model in &models {
+            self.cancel(model);
+        }
+        models
     }
 
     pub fn cancel(self: &Arc<Self>, model: &str) -> bool {
@@ -379,9 +534,13 @@ impl Downloads {
             let model = tx.borrow().model.clone();
             let token = hf::token(&me.config_home);
             tracing::info!(%model, "download started");
-            let result = download(&me.cache, &me.endpoint, token.as_deref(), &model, &tx).await;
+            let result = download(&me.cache, &me.endpoint, token.as_deref(), &model, &me.sidecars, &tx).await;
+            if let Ok(revision) = &result {
+                tx.send_modify(|d| d.status = "Putting it in use".into());
+                (me.on_done)(model.clone(), revision.clone()).await;
+            }
             tx.send_modify(|d| match &result {
-                Ok(()) => {
+                Ok(_) => {
                     d.state = DownloadState::Done;
                     d.status = "Done".into();
                     d.completed = d.total;
@@ -393,10 +552,7 @@ impl Downloads {
                 }
             });
             match &result {
-                Ok(()) => {
-                    tracing::info!(%model, "download finished");
-                    (me.on_done)();
-                }
+                Ok(revision) => tracing::info!(%model, %revision, "download finished"),
                 Err(e) => tracing::warn!(%model, error = %e, "download failed"),
             }
             me.entries.lock().expect("downloads").iter_mut().for_each(|e| {
@@ -434,34 +590,54 @@ fn active(state: DownloadState) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     fn file(path: &str, size: u64) -> File {
         File { path: path.into(), size, lfs: Some(Lfs { oid: "a".repeat(64) }) }
     }
 
+    fn names(files: &[File]) -> Vec<&str> {
+        files.iter().map(|f| f.path.as_str()).collect()
+    }
+
+    fn kinds(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
-    fn selects_one_quant_and_its_projector() {
-        let tree = [file("model-PQ2_0.gguf", 10), file("model-PTQ1_0.gguf", 8), file("mmproj-BF16.gguf", 4), file("mmproj-Q8_0.gguf", 2)];
-        let files = selected_files(&tree, "PTQ1_0").unwrap();
-        assert_eq!(files.iter().map(|f| f.path.as_str()).collect::<Vec<_>>(), ["mmproj-Q8_0.gguf", "model-PTQ1_0.gguf"]);
+    fn selects_one_quant_and_its_companions() {
+        let tree = [
+            file("m-PQ2_0.gguf", 10),
+            file("m-PTQ1_0.gguf", 8),
+            file("m-mmproj-BF16.gguf", 4),
+            file("m-mmproj-Q8_0.gguf", 2),
+            file("m-PQ2_0-MTP-Q8_0.gguf", 5),
+            file("m-PTQ1_0-MTP-Q8_0.gguf", 5),
+            file("m-DFlash2-Q8_0.gguf", 3),
+        ];
+        let files = selected_files(&tree, "PTQ1_0", &kinds(&["mmproj", "mtp"])).unwrap();
+        assert_eq!(names(&files), ["m-PTQ1_0-MTP-Q8_0.gguf", "m-PTQ1_0.gguf", "m-mmproj-Q8_0.gguf"]);
+        let files = selected_files(&tree, "PQ2_0", &kinds(&["mmproj", "mtp", "dflash"])).unwrap();
+        assert_eq!(names(&files), ["m-DFlash2-Q8_0.gguf", "m-PQ2_0-MTP-Q8_0.gguf", "m-PQ2_0.gguf", "m-mmproj-Q8_0.gguf"]);
+        assert_eq!(names(&selected_files(&tree, "PQ2_0", &[]).unwrap()), ["m-PQ2_0.gguf"]);
     }
 
     #[test]
     fn selects_split_parts() {
         let tree = [file("Q8_0/a-Q8_0-00001-of-00002.gguf", 5), file("Q8_0/a-Q8_0-00002-of-00002.gguf", 5), file("a-Q4_K_M.gguf", 3)];
-        assert_eq!(selected_files(&tree, "Q8_0").unwrap().len(), 2);
+        assert_eq!(selected_files(&tree, "Q8_0", &[]).unwrap().len(), 2);
     }
 
     #[test]
     fn rejects_drafters_and_bad_paths() {
         let tree = [file("model-DFlash2-Q8_0.gguf", 8)];
-        assert!(selected_files(&tree, "Q8_0").unwrap_err().contains("companion drafter"));
+        assert!(selected_files(&tree, "Q8_0", &[]).unwrap_err().contains("companion drafter"));
         let tree = [file("../escape-Q4_0.gguf", 8)];
-        assert!(selected_files(&tree, "Q4_0").unwrap_err().contains("invalid"));
+        assert!(selected_files(&tree, "Q4_0", &[]).unwrap_err().contains("invalid"));
         let tree = [File { path: "m-Q4_0.gguf".into(), size: 1, lfs: None }];
-        assert!(selected_files(&tree, "Q4_0").is_err());
+        assert!(selected_files(&tree, "Q4_0", &[]).is_err());
         assert!(parse_model("../x:Q4").is_err());
         assert_eq!(parse_model("o/r:q4_k_m").unwrap(), ("o/r".into(), "Q4_K_M".into()));
     }
@@ -471,97 +647,64 @@ mod tests {
         assert!(free_space(Path::new("/tmp/does/not/exist")).is_some_and(|f| f > 0));
     }
 
-    /// A Hugging Face stand-in serving one repository `o/r` with one file.
-    async fn fake_hub(body: Vec<u8>, oid: String) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
-        use http_body_util::Full;
-        use hyper::{Response, body::Bytes};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let ranges = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let seen = ranges.clone();
-        let sha = "a".repeat(40);
-        tokio::spawn(async move {
-            loop {
-                let (stream, _) = listener.accept().await.unwrap();
-                let (body, oid, sha, seen) = (body.clone(), oid.clone(), sha.clone(), seen.clone());
-                tokio::spawn(async move {
-                    let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
-                        let (body, oid, sha, seen) = (body.clone(), oid.clone(), sha.clone(), seen.clone());
-                        async move {
-                            let path = req.uri().path().to_string();
-                            let reply = if path == "/api/models/o/r" {
-                                Response::new(Full::new(Bytes::from(format!("{{\"sha\":\"{sha}\"}}"))))
-                            } else if path.starts_with("/api/models/o/r/tree/") {
-                                let tree = format!("[{{\"path\":\"m-Q4_0.gguf\",\"size\":{},\"lfs\":{{\"oid\":\"{oid}\"}}}},{{\"path\":\"README.md\",\"size\":3}}]", body.len());
-                                Response::new(Full::new(Bytes::from(tree)))
-                            } else if path == format!("/o/r/resolve/{sha}/m-Q4_0.gguf") {
-                                let start = req
-                                    .headers()
-                                    .get("range")
-                                    .and_then(|r| r.to_str().ok()?.strip_prefix("bytes=")?.strip_suffix('-')?.parse::<usize>().ok());
-                                match start {
-                                    Some(start) => {
-                                        seen.fetch_add(1, Ordering::SeqCst);
-                                        let mut r = Response::new(Full::new(Bytes::from(body[start..].to_vec())));
-                                        *r.status_mut() = hyper::StatusCode::PARTIAL_CONTENT;
-                                        r
-                                    }
-                                    None => Response::new(Full::new(Bytes::from(body))),
-                                }
-                            } else {
-                                let mut r = Response::new(Full::new(Bytes::new()));
-                                *r.status_mut() = hyper::StatusCode::NOT_FOUND;
-                                r
-                            };
-                            Ok::<_, std::convert::Infallible>(reply)
-                        }
-                    });
-                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(stream), service).await;
-                });
-            }
-        });
-        (format!("http://{addr}"), ranges)
-    }
+    pub(crate) use crate::testhub::{fake_hub, gguf_bytes};
 
-    fn model_file() -> (Vec<u8>, String) {
-        let mut body = b"GGUF\x03\0\0\0".to_vec();
-        body.extend((0..200_000u32).map(|i| (i % 251) as u8));
-        let oid = format!("{:x}", Sha256::digest(&body));
-        (body, oid)
-    }
-
-    use std::sync::atomic::Ordering;
-
-    fn progress() -> watch::Sender<Download> {
+    pub(crate) fn progress() -> watch::Sender<Download> {
         watch::channel(Download { model: "o/r:Q4_0".into(), state: DownloadState::Running, status: String::new(), completed: 0, total: 0, error: None }).0
     }
 
     #[tokio::test]
     async fn downloads_resumes_and_checks() {
-        let (body, oid) = model_file();
-        let (endpoint, ranges) = fake_hub(body.clone(), oid.clone()).await;
+        let body = gguf_bytes(1, 200_000);
+        let oid = format!("{:x}", Sha256::digest(&body));
+        let (endpoint, hub) = fake_hub().await;
+        hub.set("a", &[("m-Q4_0.gguf", &body)]);
         let cache = tempfile::tempdir().unwrap();
         let base = repo_dir(cache.path(), "o/r");
         std::fs::create_dir_all(base.join("blobs")).unwrap();
         std::fs::write(base.join("blobs").join(format!("{oid}.incomplete")), &body[..50_000]).unwrap();
         let tx = progress();
-        download(cache.path(), &endpoint, None, "o/r:q4_0", &tx).await.unwrap();
-        assert_eq!(ranges.load(Ordering::SeqCst), 1, "it resumed from the partial file");
+        let revision = download(cache.path(), &endpoint, None, "o/r:q4_0", &[], &tx).await.unwrap();
+        assert_eq!(revision, "a".repeat(40));
+        assert_eq!(hub.ranges.load(Ordering::SeqCst), 1, "it resumed from the partial file");
         assert_eq!(std::fs::read(base.join("blobs").join(&oid)).unwrap(), body);
-        let snapshot = base.join("snapshots").join("a".repeat(40)).join("m-Q4_0.gguf");
+        let snapshot = base.join("snapshots").join(&revision).join("m-Q4_0.gguf");
         assert_eq!(std::fs::read(&snapshot).unwrap(), body);
-        assert_eq!(std::fs::read_to_string(base.join("refs/main")).unwrap(), "a".repeat(40));
+        assert!(current_revision(cache.path(), "o/r").is_none(), "a download doesn't put itself in use");
         assert_eq!((tx.borrow().completed, tx.borrow().total), (body.len() as u64, body.len() as u64));
+        switch_revision(cache.path(), "o/r", &revision).unwrap();
+        assert_eq!(current_revision(cache.path(), "o/r").as_deref(), Some(revision.as_str()));
         assert_eq!(hf::cached_file(cache.path(), "o/r:Q4_0").unwrap(), snapshot);
 
-        let (endpoint, _) = fake_hub(body.clone(), "b".repeat(64)).await;
+        hub.lie_about("m-Q4_0.gguf");
         let other = tempfile::tempdir().unwrap();
-        let err = download(other.path(), &endpoint, None, "o/r:Q4_0", &progress()).await.unwrap_err();
+        let err = download(other.path(), &endpoint, None, "o/r:Q4_0", &[], &progress()).await.unwrap_err();
         assert!(err.message.contains("checksum mismatch"), "{err:?}");
         assert!(!repo_dir(other.path(), "o/r").join("blobs").join(format!("{}.incomplete", "b".repeat(64))).exists());
-
-        let err = download(other.path(), &endpoint, None, "o/r:Q8_0", &progress()).await.unwrap_err();
+        let err = download(other.path(), &endpoint, None, "o/r:Q8_0", &[], &progress()).await.unwrap_err();
         assert!(err.message.contains("not in the Hugging Face repository"));
+    }
+
+    #[tokio::test]
+    async fn switching_keeps_other_quants_and_prunes_replaced_blobs() {
+        let (endpoint, hub) = fake_hub().await;
+        let cache = tempfile::tempdir().unwrap();
+        let (q4, q8, q4_new) = (gguf_bytes(1, 1000), gguf_bytes(2, 1000), gguf_bytes(3, 1000));
+        hub.set("a", &[("m-Q4_0.gguf", &q4), ("m-Q8_0.gguf", &q8)]);
+        for model in ["o/r:Q4_0", "o/r:Q8_0"] {
+            let rev = download(cache.path(), &endpoint, None, model, &[], &progress()).await.unwrap();
+            switch_revision(cache.path(), "o/r", &rev).unwrap();
+        }
+        hub.set("b", &[("m-Q4_0.gguf", &q4_new), ("m-Q8_0.gguf", &q8)]);
+        let rev = download(cache.path(), &endpoint, None, "o/r:Q4_0", &[], &progress()).await.unwrap();
+        switch_revision(cache.path(), "o/r", &rev).unwrap();
+        let links = snapshot_links(cache.path(), "o/r", &rev);
+        assert_eq!(links.len(), 2, "the Q8_0 file came along: {links:?}");
+        assert_eq!(std::fs::read(hf::cached_file(cache.path(), "o/r:Q4_0").unwrap()).unwrap(), q4_new);
+        assert_eq!(std::fs::read(hf::cached_file(cache.path(), "o/r:Q8_0").unwrap()).unwrap(), q8);
+        let blobs = std::fs::read_dir(repo_dir(cache.path(), "o/r").join("blobs")).unwrap().count();
+        assert_eq!(blobs, 2, "the old Q4_0 blob is gone");
+        assert!(!repo_dir(cache.path(), "o/r").join("snapshots").join("a".repeat(40)).exists());
     }
 
     #[test]

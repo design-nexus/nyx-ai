@@ -9,17 +9,21 @@ second runtime.
 
 | | |
 |---|---|
-| Tag | `prism-b10826-c9c34bc` |
-| Asset | `llama-prism-b10826-c9c34bc-bin-linux-cuda-13.3-x64.tar.gz` |
-| SHA-256 | `43e203be88b8c2fbebb24d518078c3ff02df742970d89f739e9dc23646c6ff2d` |
+| Tag | `prism-b12128-d7b2896` (31 October 2026; upstream merged at `d854d98`) |
+| Asset | `llama-prism-b12128-d7b2896-bin-linux-cuda-13.3-x64.tar.gz` (204 MB) |
+| SHA-256 | `9f3a8d2de2b69936b8ec7c994579ad419cb2918785483d80091b6b2776b880bd` |
 | Installed in | `~/.local/lib/nyx-ai/llama.cpp` (`.release` holds the tag) |
 
 ## What Nyx relies on that upstream lacks
 
 | Feature | Used by | Upstream status (Nov 2026) |
 |---|---|---|
-| `PQ2_0` (ggml type 142) and `PTQ1_0` (type 143) ternary packings | Ternary Bonsai 2 (9B, 27B) | Not in upstream |
-| `prism.hadamard` activation transform | Ternary Bonsai 2 | Not in upstream; upstream loads Bonsai 9B and produces nonsense (Assistant `docs/BENCHMARKS.md`) |
+| `PQ2_0` (ggml type 142) and `PTQ1_0` (type 143) ternary packings | Ternary Bonsai 2 (9B, 27B) | Not in upstream b12199 (7 Nov); it rejects those files as unknown types. Upstream runs Bonsai's plain `Q2_0` file from b11556 on |
+| `prism.hadamard` activation transform and its fused CUDA kernels | Ternary Bonsai 2 | Not in upstream for these types |
+| MTP heads and DFlash2/DSpark drafters for Bonsai | speculative decoding | Prism only |
+
+The `prism` branch carries about 250 commits over upstream (Nov 2026), so AI Core
+pins Prism's releases rather than keeping its own merge.
 
 Everything else AI Core uses is upstream router-mode `llama-server`:
 `--models-preset`, `--no-models-autoload`, `--models-max`, `--host *.sock`,
@@ -49,13 +53,24 @@ Record the results here with the upstream tag tested.
 
 ## Updating the Prism pin
 
-1. Pick the new tag and asset from the fork's releases; note its SHA-256.
+1. `scripts/check-llama.sh` lists newer releases with each asset's SHA-256.
 2. Update `tag`, `asset` and `digest` in `scripts/install-llama.sh`.
 3. Run checks 1 to 7 above against the new build.
 4. Reinstall (`./install.sh`); the script replaces the build only when the tag
-   changes. `nyx-aid` picks up the new worker on its next start.
+   changes (into a fresh folder, swapped in). The installer restarts
+   `nyx-aid.socket`, so the next request starts the new worker.
 
-## Verified through AI Core (7 November 2026, RTX 5080 Laptop, CUDA)
+## Verified through AI Core (RTX 5080 Laptop, CUDA)
+
+`prism-b12128-d7b2896`, 7 November 2026:
+
+| Model | Check | Result |
+|---|---|---|
+| Gemma 4 E2B Q4_K_M + BF16 mmproj (folder) | chat, tool call, image | all correct; about 190-210 tokens/s |
+| Ternary Bonsai 2 9B `PQ2_0` (cache) | chat at temperature 0 | correct ("Paris"); about 100 tokens/s |
+| EmbeddingGemma 2 Q8_0 (Glimpse's folder) | embed three texts | 768 dimensions; cat/kitten 0.94, cat/tax 0.53 |
+
+`prism-b10826-c9c34bc`, the earlier pin:
 
 | Model | Check | Result |
 |---|---|---|
@@ -74,14 +89,9 @@ load must use only what's on disk.
 
 ## Open questions for Handoff 05
 
-- **EmbeddingGemma 2 needs a newer build.** `prism-b10826` predates
-  `gemma-embedding2`, which upstream `b11461` (Glimpse's build) supports. Moving
-  Glimpse onto AI Core needs a Prism release rebased past upstream `b11461`, or
-  upstream gaining the Prism quant types. Until then Glimpse keeps its own runner;
-  one engine must not mean losing Glimpse's model.
-- **Multimodal embeddings.** Glimpse embeds images and audio through mtmd. Whether
-  the router's `/v1/embeddings` takes image and audio parts for EmbeddingGemma 2
-  on the next Prism build is not verified. If not, AI Core gets a second worker
+- **Multimodal embeddings.** `prism-b12128` embeds text with EmbeddingGemma 2.
+  Glimpse also embeds images and audio through mtmd; whether the router's
+  `/v1/embeddings` takes image and audio parts for it is not verified. If not, AI Core gets a second worker
   *kind* built from the same llama.cpp tree (the generalised `glimpse-embed`),
   supervised the same way.
 - **GBNF grammars** (Assistant's planner): the router accepts `grammar` in chat

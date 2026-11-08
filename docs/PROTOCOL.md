@@ -56,6 +56,19 @@ daemon. Lines are at most 64 MiB. A connection may have 32 requests open.
 | `list_capabilities` | | | `capabilities` |
 | `service_settings` | | | `service` |
 | `configure_service` | `max_loaded`, `idle_unload_seconds` (both optional) | | `service` |
+| `check_updates` | | | `models` (those with `update_available`) |
+
+### Updates
+
+`download_model` always fetches the repository's newest revision: the model's
+files plus the companions in `sidecars` (`settings.toml`; `mmproj` and `mtp` by
+default). The revision goes into use when none of the repository's models is busy
+or was used in the last two minutes; until then the old files keep serving.
+`check_updates` compares each cached model with the newest revision and sets
+`update_available` and `update_size` (bytes to download) on the models whose files
+or companions differ. With `model_updates = "auto"` AI Core checks every
+`update_check_hours` and downloads updates itself while nothing runs and the
+computer is on mains power, pausing otherwise.
 
 `remove_model` deletes cache models only (folder and preset models are refused
 with `permission_denied`). For a model still downloading it stops the download and
@@ -103,7 +116,7 @@ A `model` has `id`, `name`, `source` (`cache`, `folder`, `preset`), `path`,
 `capabilities` (`chat`, `tools`, `thinking`, `vision`, `audio`, `embedding`,
 `draft`), `state` (`downloading`, `validating`, `installed`, `loading`, `ready`,
 `busy`, `unloading`, `failed`, `missing`), `revision`, `pinned`, `removable`,
-`pending_settings` and `error`.
+`pending_settings`, `error`, `update_available` and `update_size`.
 
 Capabilities come from GGUF metadata and the worker, never from the file name.
 `tools` and `thinking` mean the chat template handles them.
@@ -148,3 +161,5 @@ shape (`{"error": {"code", "message", "type"}}`).
 ## Changes
 
 - Version 1 (November 2026): first release.
+- Version 1, additions: `check_updates`; `Model.update_available` and
+  `update_size`; `ServiceSettings.openai_endpoint` and `model_updates`.

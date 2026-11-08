@@ -14,6 +14,14 @@ nyx-ai pull org/repo:Q4_K_M
 nyx-ai chat org/repo:Q4_K_M "Hello"
 ```
 
+## Model updates
+
+AI Core checks Hugging Face daily for newer revisions of cached models
+(`nyx-ai updates` checks now). With `model_updates = "auto"` (the default) it
+downloads them while nothing is running and the computer is on mains power, and
+switches a model over once it hasn't been used for two minutes. Set `notify` to
+only report updates, or `off`. llama.cpp itself never downloads.
+
 ## Coding tools
 
 AI Core serves an OpenAI-compatible API at `http://127.0.0.1:8080/v1` (loopback
