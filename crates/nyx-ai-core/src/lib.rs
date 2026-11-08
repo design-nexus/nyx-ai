@@ -1,5 +1,6 @@
 //! Nyx AI Core's daemon: see `docs/ARCHITECTURE.md`.
 
+pub mod actions;
 pub mod config;
 pub mod diagnostics;
 pub mod downloads;

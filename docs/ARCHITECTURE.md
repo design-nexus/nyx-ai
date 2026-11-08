@@ -94,6 +94,10 @@ unloaded mid-reply). Closing the connection cancels the request. Like the old
   loading with eviction, pins ("keep loaded") and idle unloading.
 - `worker`: the supervisor and the HTTP-over-Unix-socket client.
 - `stream`: the router's SSE turned into ordered events.
+- `actions`: the shared action registry. It discovers running apps' D-Bus
+  control interfaces, holds actions providers register over their connection,
+  validates arguments against each action's JSON Schema, gates untrusted
+  callers and unconfirmed calls, and routes calls to the owning app.
 - `service`: one handler per operation.
 - `server`: the socket, peer checks, handshake, per-connection request tables.
 - `diagnostics`: counters and averages without prompt or reply content.
@@ -108,6 +112,7 @@ unloaded mid-reply). Closing the connection cancels the request. Like the old
 | Loading, unloading, eviction, pins | Which model a feature uses |
 | Scheduling and priorities | Search indexes, ranking, RAG stores |
 | Capability metadata | UI and app settings |
+| Action discovery, argument checks, routing | Whether an action runs: permissions, refusal |
 
 ## Requests
 

@@ -2,7 +2,7 @@
 //! list, chat, embeddings, eviction, cancel, crash recovery and settings.
 
 use nyx_ai_client::proto::{
-    ChatRequest, ClientLine, ErrorKind, Event, Hello, Message, ModelState, Op, Priority, Role, ServerLine, encode,
+    ActionSpec, ChatRequest, Confirmation, SideEffects, ClientLine, ErrorKind, Event, Hello, Message, ModelState, Op, Priority, Role, ServerLine, encode,
 };
 use nyx_ai_client::{Client, Item};
 use nyx_ai_core::paths::Paths;
@@ -263,7 +263,7 @@ async fn settings_pins_and_removal() {
     assert_eq!((service.max_loaded, service.idle_unload_seconds), (2, 300));
     assert!(h.client.configure_service(Some(99), None).await.is_err());
 
-    let untrusted = Caller { name: "untrusted:x".into(), trusted: false };
+    let untrusted = Caller { name: "untrusted:x".into(), trusted: false, connection: 0 };
     let op = Op::RemoveModel { model: "org/chat:Q4_K_M".into() };
     assert_eq!(h.service.authorize(&untrusted, &op).unwrap_err().kind, ErrorKind::PermissionDenied);
     assert!(h.service.authorize(&untrusted, &Op::ListModels {}).is_ok());
@@ -470,5 +470,71 @@ async fn protocol_errors_are_explicit() {
     );
     let mode = std::fs::metadata(&h.paths.socket).map(|m| std::os::unix::fs::PermissionsExt::mode(&m.permissions())).unwrap();
     assert_eq!(mode & 0o777, 0o600);
+    h.stop().await;
+}
+
+fn action(id: &str, side_effects: SideEffects, confirmation: Confirmation) -> ActionSpec {
+    ActionSpec {
+        id: id.into(),
+        description: format!("test {id}"),
+        input_schema: serde_json::json!({"type": "object", "properties": {"text": {"type": "string"}}, "required": ["text"]}),
+        output_schema: None,
+        permissions: vec!["notes.read".into()],
+        confirmation,
+        side_effects,
+        timeout_ms: Some(5000),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn apps_offer_actions_and_calls_are_checked() {
+    use serde_json::json;
+    let h = Harness::start().await;
+    let specs = vec![action("notes.find", SideEffects::ReadOnly, Confirmation::Never), action("notes.create", SideEffects::Writes, Confirmation::Ask)];
+    let mut server = h.client.serve_actions(specs.clone()).await.unwrap();
+    let provider = tokio::spawn(async move {
+        while let Some(Ok(call)) = server.next().await {
+            let outcome = match call.action.as_str() {
+                "notes.find" => Ok(json!({"found": call.arguments["text"], "caller": call.caller})),
+                _ => Err("the notebook is locked".to_string()),
+            };
+            server.answer(call.id, outcome).await.unwrap();
+        }
+    });
+    let mut listed = Vec::new();
+    for _ in 0..100 {
+        listed = h.client.list_actions().await.unwrap();
+        if listed.iter().any(|a| a.spec.id == "notes.find") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let find = listed.iter().find(|a| a.spec.id == "notes.find").expect("listed");
+    assert_eq!(find.source, "connection");
+    assert_eq!(find.spec.permissions, vec!["notes.read".to_string()]);
+
+    let found = h.client.invoke_action("notes.find", json!({"text": "milk"}), false).await.unwrap();
+    assert_eq!(found["found"], "milk");
+    let kind = |r: nyx_ai_client::Result<serde_json::Value>| r.unwrap_err().kind;
+    assert_eq!(kind(h.client.invoke_action("notes.find", json!({"text": 3}), false).await), ErrorKind::InvalidRequest);
+    assert_eq!(kind(h.client.invoke_action("notes.create", json!({"text": "milk"}), false).await), ErrorKind::ConfirmationRequired);
+    let refused = h.client.invoke_action("notes.create", json!({"text": "milk"}), true).await.unwrap_err();
+    assert_eq!((refused.kind, refused.message.as_str()), (ErrorKind::ActionFailed, "the notebook is locked"));
+    assert_eq!(kind(h.client.invoke_action("notes.nothing", json!({}), true).await), ErrorKind::UnknownAction);
+
+    let taken = h.client.serve_actions(specs).await.unwrap().next().await.unwrap().unwrap_err();
+    assert_eq!(taken.kind, ErrorKind::InvalidRequest);
+
+    provider.abort();
+    let _ = provider.await;
+    let mut gone = false;
+    for _ in 0..100 {
+        if !h.client.list_actions().await.unwrap().iter().any(|a| a.spec.id == "notes.find") {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(gone, "a closed connection withdraws its actions");
     h.stop().await;
 }

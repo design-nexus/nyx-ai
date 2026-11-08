@@ -1,6 +1,7 @@
 //! One handler per operation, over the registry, presets, worker, scheduler and
 //! downloads.
 
+use crate::actions::Actions;
 use crate::config::Settings;
 use crate::diagnostics::Metrics;
 use crate::downloads::Downloads;
@@ -33,6 +34,8 @@ pub struct Caller {
     /// The trusted program's name, or `untrusted:<declared name>`.
     pub name: String,
     pub trusted: bool,
+    /// Which socket connection (actions are answered on the one they were sent to).
+    pub connection: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -181,9 +184,10 @@ pub struct Service {
     update_tries: Mutex<HashMap<String, Instant>>,
     switch_lock: tokio::sync::Mutex<()>,
     started: Instant,
+    actions: Actions,
 }
 
-const PRIVILEGED: &[&str] = &["remove_model", "configure_model", "configure_service"];
+const PRIVILEGED: &[&str] = &["remove_model", "configure_model", "configure_service", "serve_actions"];
 
 impl Service {
     pub fn new(paths: Paths, options: Options) -> Arc<Service> {
@@ -248,6 +252,7 @@ impl Service {
                 update_tries: Mutex::new(HashMap::new()),
                 switch_lock: tokio::sync::Mutex::new(()),
                 started: Instant::now(),
+                actions: Actions::default(),
             }
         })
     }
@@ -502,6 +507,14 @@ impl Service {
             Op::ConfigureService { max_loaded, idle_unload_seconds, model_updates, defaults } => {
                 self.configure_service(max_loaded, idle_unload_seconds, model_updates, defaults).await.map(Reply::Service)
             }
+            Op::ListActions {} => Ok(Reply::Actions { actions: self.actions.list().await }),
+            Op::InvokeAction { action, arguments, confirmed } => self
+                .actions
+                .invoke(caller, &action, arguments, confirmed, self.options.allow_untrusted, &cancel)
+                .await
+                .map(|result| Reply::ActionDone { result }),
+            Op::ServeActions { actions } => self.actions.serve(caller, actions, events, cancel).await.map(|_| Reply::Ok),
+            Op::ActionResult { invocation, ok, error } => self.actions.answer(caller, invocation, ok, error).map(|_| Reply::Ok),
         }
     }
 
@@ -993,7 +1006,7 @@ impl Service {
             return Err(Error::new(ErrorKind::UnsupportedCapability, format!("{model} can't serve {path}")));
         }
         Metrics::inc(&self.metrics.requests);
-        let caller = Caller { name: "openai".into(), trusted: false };
+        let caller = Caller { name: "openai".into(), trusted: false, connection: 0 };
         let lease = self.scheduler.acquire(model, &caller.name, Priority::Normal, cancel, None).await?;
         let http = self.shared.worker.ready().await?;
         let response = tokio::select! {

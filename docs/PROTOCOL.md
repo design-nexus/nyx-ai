@@ -57,6 +57,10 @@ daemon. Lines are at most 64 MiB. A connection may have 32 requests open.
 | `service_settings` | | | `service` |
 | `configure_service` | `max_loaded`, `idle_unload_seconds`, `model_updates`, `defaults` (`{role: model}`, `""` clears) (all optional) | | `service` |
 | `check_updates` | | | `models` (those with `update_available`) |
+| `list_actions` | | | `actions` |
+| `invoke_action` | `action`, `arguments` (JSON), `confirmed` | | `action_done` (`result`) |
+| `serve_actions` | `actions` (specs, below) | `invoke` | `ok` when the request ends |
+| `action_result` | `invocation`, `ok` or `error` | | `ok` |
 
 ### Updates
 
@@ -142,6 +146,49 @@ Other keys already in `~/.config/nyx-ai/models.ini` are kept as they are.
 Changes to a loaded model apply when it's next idle (it unloads and the next
 request loads it with the new settings); `pending_settings` shows that.
 
+### Actions
+
+The shared action registry: what apps can do for an assistant (or any caller).
+Actions come from two places:
+
+- Running Nyx apps' D-Bus control interfaces
+  (`io.github.design_nexus.nyx.Control` at the GApplication object path, with
+  `Describe() -> s` and `Call(s name, s arguments) -> s`). AI Core asks every
+  `io.github.design_nexus.nyx.*` name on the session bus, at most every 10 s.
+  `Describe` returns MCP-style tools: `name`, `description`, `inputSchema`, and
+  optional `outputSchema` and `annotations` (`readOnlyHint`, `destructiveHint`,
+  `openWorldHint`). A tool without `readOnlyHint: true` asks first.
+- Providers connected to AI Core: `serve_actions` offers specs for as long as
+  the request stays open. Each call arrives as an `invoke` event (`invocation`,
+  `action`, `arguments`, `caller`), answered on the same connection with
+  `action_result`. Closing the request or the connection withdraws the actions
+  and fails calls in flight with `unavailable`. Only trusted programs may serve.
+
+A spec (and an `actions` entry, which adds `owner`, `source` (`dbus` or
+`connection`) and `available`):
+
+```json
+{"id": "notes.create", "description": "Create a note.",
+ "input_schema": {"type": "object", "properties": {"text": {"type": "string"}},
+   "required": ["text"]},
+ "output_schema": {"type": "object"}, "permissions": ["notes.write"],
+ "confirmation": "ask", "side_effects": "writes", "timeout_ms": 30000}
+```
+
+- `id` is `app.verb` in lowercase (dots, digits, `-` and `_` allowed after the app).
+- `confirmation` is `ask` (default) or `never`; `side_effects` is `read_only`,
+  `writes`, `external`, `destructive` or `unknown` (default, treated as `writes`).
+- `timeout_ms` defaults to 30 s, at most 300 s.
+
+`invoke_action` checks, in order: the action exists (`unknown_action`) and is
+available (`unavailable`); an untrusted caller may run only `read_only` actions
+(`permission_denied`); an action that asks first needs `confirmed: true`
+(`confirmation_required`), which the caller sends only after the person agreed in
+its own UI; the arguments match `input_schema` (`invalid_request`, naming the
+place). Then it routes the call. The owning app checks its own permissions and
+may refuse: its message comes back as `action_failed`. AI Core logs the action,
+caller, owner, outcome and duration, never the arguments or result.
+
 ## OpenAI-compatible endpoint
 
 Separate from this protocol: `http://127.0.0.1:8080/v1` (see `ARCHITECTURE.md`).
@@ -156,7 +203,7 @@ shape (`{"error": {"code", "message", "type"}}`).
 `unknown_model`, `unknown_request`, `unsupported_capability`,
 `resource_exhausted`, `busy`, `permission_denied`, `worker_unavailable`,
 `worker_failed`, `model_load_failed`, `download_failed`, `cancelled`, `timeout`,
-`internal`. The client adds `unavailable` when it can't reach the daemon.
+`unknown_action`, `confirmation_required`, `action_failed`, `internal`. The client adds `unavailable` when it can't reach the daemon.
 
 ## Changes
 
@@ -164,6 +211,9 @@ shape (`{"error": {"code", "message", "type"}}`).
 - Version 1, additions: `check_updates`; `Model.update_available` and
   `update_size`; `ServiceSettings.openai_endpoint`, `model_updates` and
   `defaults`; `configure_service`'s `model_updates` and `defaults`.
+- Version 1, additions: actions (`list_actions`, `invoke_action`,
+  `serve_actions`, `action_result`, the `invoke` event, and the errors
+  `unknown_action`, `confirmation_required` and `action_failed`).
 
 ## Default models
 

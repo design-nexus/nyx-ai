@@ -121,6 +121,8 @@ pub async fn serve(service: Arc<Service>, listener: std::os::unix::net::UnixList
 
 /// Name the peer by the program it runs.
 fn identify(pid: Option<i32>, declared: &str) -> Caller {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let connection = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let declared: String = declared.chars().filter(|c| c.is_ascii_alphanumeric() || "-_.".contains(*c)).take(64).collect();
     let own = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf));
     let program = pid
@@ -128,8 +130,8 @@ fn identify(pid: Option<i32>, declared: &str) -> Caller {
         .zip(own)
         .and_then(|(exe, own)| nyx_peer::program(&exe, &own));
     match program {
-        Some(name) => Caller { name, trusted: true },
-        None => Caller { name: format!("untrusted:{}", if declared.is_empty() { "unknown" } else { &declared }), trusted: false },
+        Some(name) => Caller { name, trusted: true, connection },
+        None => Caller { name: format!("untrusted:{}", if declared.is_empty() { "unknown" } else { &declared }), trusted: false, connection },
     }
 }
 

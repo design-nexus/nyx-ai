@@ -143,6 +143,30 @@ pub enum Op {
     ServiceSettings {},
     /// Check Hugging Face for newer revisions of cached models now.
     CheckUpdates {},
+    /// Actions apps offer (their D-Bus control interfaces and registered providers).
+    ListActions {},
+    /// Run an action. `confirmed`: the person agreed to it in the caller's UI, for
+    /// actions that ask first.
+    InvokeAction {
+        action: String,
+        #[serde(default)]
+        arguments: Value,
+        #[serde(default)]
+        confirmed: bool,
+    },
+    /// Offer actions for as long as this request stays open; each call arrives as
+    /// an `invoke` event, answered with `action_result`.
+    ServeActions {
+        actions: Vec<ActionSpec>,
+    },
+    /// The answer to an `invoke` event this connection received.
+    ActionResult {
+        invocation: u64,
+        #[serde(default)]
+        ok: Option<Value>,
+        #[serde(default)]
+        error: Option<String>,
+    },
     ConfigureService {
         #[serde(default)]
         max_loaded: Option<u32>,
@@ -179,6 +203,10 @@ pub const OPERATIONS: &[&str] = &[
     "service_settings",
     "configure_service",
     "check_updates",
+    "list_actions",
+    "invoke_action",
+    "serve_actions",
+    "action_result",
 ];
 
 impl Op {
@@ -203,6 +231,10 @@ impl Op {
             Op::ListCapabilities {} => "list_capabilities",
             Op::ServiceSettings {} => "service_settings",
             Op::CheckUpdates {} => "check_updates",
+            Op::ListActions {} => "list_actions",
+            Op::InvokeAction { .. } => "invoke_action",
+            Op::ServeActions { .. } => "serve_actions",
+            Op::ActionResult { .. } => "action_result",
             Op::ConfigureService { .. } => "configure_service",
         }
     }
@@ -498,6 +530,76 @@ pub fn valid_model_id(id: &str) -> Result<(), String> {
     if ok { Ok(()) } else { Err(format!("invalid model id {id:?}")) }
 }
 
+// ---------- Actions ----------
+
+/// Whether an action needs the person's go-ahead first.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Confirmation {
+    /// Runs when called.
+    Never,
+    /// The caller must pass `confirmed: true` after asking.
+    #[default]
+    Ask,
+}
+
+/// What an action does to the world.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum SideEffects {
+    /// Only reads.
+    ReadOnly,
+    /// Changes the person's data or settings.
+    Writes,
+    /// Sends something out of the computer (a message, a request).
+    External,
+    /// Deletes or overwrites.
+    Destructive,
+    /// Not declared; treated like `writes`.
+    #[default]
+    Unknown,
+}
+
+/// An action as a provider declares it.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct ActionSpec {
+    /// `app.verb`, e.g. `notes.create`.
+    pub id: String,
+    pub description: String,
+    /// JSON Schema of the arguments.
+    #[serde(default = "empty_object_schema")]
+    pub input_schema: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    /// Permissions the owner checks (named by the owner, e.g. `files.read`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub permissions: Vec<String>,
+    #[serde(default)]
+    pub confirmation: Confirmation,
+    #[serde(default)]
+    pub side_effects: SideEffects,
+    /// How long a call may take before it fails (default 30 s).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+fn empty_object_schema() -> Value {
+    serde_json::json!({"type": "object"})
+}
+
+/// An action in the registry.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct ActionInfo {
+    #[serde(flatten)]
+    pub spec: ActionSpec,
+    /// The app offering it (`nyx-chat`, or its D-Bus name).
+    pub owner: String,
+    /// `dbus` (an app's control interface) or `connection` (registered with AI Core).
+    pub source: String,
+    pub available: bool,
+}
+
 // ---------- Events ----------
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -517,6 +619,8 @@ pub enum Event {
         tool_calls: Vec<ToolCallDelta>,
     },
     Progress { status: String, completed: u64, total: u64 },
+    /// A call to one of this connection's served actions; answer with `action_result`.
+    Invoke { invocation: u64, action: String, arguments: Value, caller: String },
 }
 
 /// Part of a tool call; parts with the same `index` concatenate.
@@ -550,6 +654,9 @@ pub enum Reply {
     Worker(WorkerStatus),
     Capabilities(Capabilities),
     Service(ServiceSettings),
+    Actions { actions: Vec<ActionInfo> },
+    /// What an action returned.
+    ActionDone { result: Value },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -861,6 +968,12 @@ pub enum ErrorKind {
     Timeout,
     /// The client couldn't reach the daemon.
     Unavailable,
+    /// No app offers that action.
+    UnknownAction,
+    /// The action asks first: call again with `confirmed: true` once the person agrees.
+    ConfirmationRequired,
+    /// The owning app refused or failed; the message is its own.
+    ActionFailed,
     Internal,
 }
 

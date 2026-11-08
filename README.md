@@ -57,3 +57,13 @@ let reply = client.chat(request).await?.collect_chat().await?;
 ```
 
 Depend on `nyx-ai-client` by Git revision.
+
+## Actions
+
+AI Core keeps one list of what apps can do, for Nyx Assistant and anything else
+that acts for the person: `nyx-ai actions` lists it and `nyx-ai act ID JSON`
+runs one. Running Nyx apps' D-Bus control interfaces are found on their own;
+other programs offer actions with `Client::serve_actions`. AI Core checks the
+arguments against each action's schema and asks callers to confirm actions that
+change things; the app that owns an action decides whether to do it. See
+`docs/PROTOCOL.md`.

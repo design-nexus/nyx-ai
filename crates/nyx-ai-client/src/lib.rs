@@ -7,10 +7,11 @@
 pub use nyx_ai_proto as proto;
 
 use proto::{
-    API_VERSION, Capabilities, ChatRequest, ClientLine, Download, Embeddings, Error, ErrorKind, Event, Hello, MAX_LINE, Model,
+    API_VERSION, ActionInfo, ActionSpec, Capabilities, ChatRequest, ClientLine, Download, Embeddings, Error, ErrorKind, Event, Hello, MAX_LINE, Model,
     ModelDetail, ModelSettings, Op, Priority, Reply, Request, ResourceStatus, ServerLine, ServiceSettings, ToolCallDelta,
     WorkerStatus, encode,
 };
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -243,6 +244,29 @@ impl Client {
         self.configure_service_with(Op::ConfigureService { max_loaded, idle_unload_seconds, model_updates: None, defaults: None }).await
     }
 
+    /// The actions apps offer.
+    pub async fn list_actions(&self) -> Result<Vec<ActionInfo>> {
+        match self.call(Op::ListActions {}).await? {
+            Reply::Actions { actions } => Ok(actions),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Run an action. Pass `confirmed` only after the person agreed in your UI; an
+    /// action that asks first fails with `confirmation_required` otherwise.
+    pub async fn invoke_action(&self, action: &str, arguments: Value, confirmed: bool) -> Result<Value> {
+        match self.call(Op::InvokeAction { action: action.into(), arguments, confirmed }).await? {
+            Reply::ActionDone { result } => Ok(result),
+            other => Err(unexpected(&other)),
+        }
+    }
+
+    /// Offer actions for as long as the returned server lives.
+    pub async fn serve_actions(&self, actions: Vec<ActionSpec>) -> Result<ActionServer> {
+        let stream = self.stream(Op::ServeActions { actions }).await?;
+        Ok(ActionServer { conn: stream.conn, next_id: 2, done: false })
+    }
+
     /// Any of `configure_service`'s settings (`op` is an `Op::ConfigureService`).
     pub async fn configure_service_with(&self, op: Op) -> Result<ServiceSettings> {
         match self.call(op).await? {
@@ -305,6 +329,64 @@ impl Connection {
 
 fn lost(e: std::io::Error) -> Error {
     Error::new(ErrorKind::Unavailable, format!("lost the connection to Nyx AI Core: {e}"))
+}
+
+/// One call to a served action.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Invocation {
+    pub id: u64,
+    pub action: String,
+    pub arguments: Value,
+    /// The program that asked (AI Core's name for it).
+    pub caller: String,
+}
+
+/// The actions one connection offers. Calls come one at a time from [`next`](Self::next);
+/// answer each with [`answer`](Self::answer). Dropping it withdraws the actions.
+pub struct ActionServer {
+    conn: Connection,
+    next_id: u64,
+    done: bool,
+}
+
+impl ActionServer {
+    /// The next call; `None` once AI Core ends the offer.
+    pub async fn next(&mut self) -> Option<Result<Invocation>> {
+        if self.done {
+            return None;
+        }
+        loop {
+            match self.conn.read().await {
+                Ok(ServerLine::Event { id: 1, event: Event::Invoke { invocation, action, arguments, caller } }) => {
+                    return Some(Ok(Invocation { id: invocation, action, arguments, caller }));
+                }
+                Ok(ServerLine::Result { id: 1, .. }) => {
+                    self.done = true;
+                    return None;
+                }
+                Ok(ServerLine::Error { id, error }) if id == Some(1) || id.is_none() => {
+                    self.done = true;
+                    return Some(Err(error));
+                }
+                Ok(_) => continue,
+                Err(e) => {
+                    self.done = true;
+                    return Some(Err(e));
+                }
+            }
+        }
+    }
+
+    /// The outcome of call `invocation`: a value, or the reason it wasn't done.
+    pub async fn answer(&mut self, invocation: u64, outcome: std::result::Result<Value, String>) -> Result<()> {
+        let (ok, error) = match outcome {
+            Ok(value) => (Some(value), None),
+            Err(e) => (None, Some(e)),
+        };
+        let id = self.next_id;
+        self.next_id += 1;
+        self.conn.send(&ClientLine::Request(Box::new(Request { id, op: Op::ActionResult { invocation, ok, error } }))).await
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

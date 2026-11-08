@@ -28,7 +28,10 @@ const USAGE: &str = "Usage: nyx-ai COMMAND [--json]
                                embedding, coding); \"\" clears it
   chat MODEL PROMPT…           ask a model (--think to show its reasoning)
   embed MODEL TEXT…            embed texts
-  capabilities                 what this Nyx AI Core supports";
+  capabilities                 what this Nyx AI Core supports
+  actions                      actions apps offer (running apps and registered providers)
+  act ACTION [JSON] [--yes]    run an action with JSON arguments (--yes: you agree to it,
+                               for actions that ask first)";
 
 fn gb(bytes: u64) -> String {
     format!("{:.1} GB", bytes as f64 / 1e9)
@@ -44,12 +47,13 @@ async fn main() -> ExitCode {
     let json = take_flag(&mut args, "--json");
     let keep = take_flag(&mut args, "--keep");
     let think = take_flag(&mut args, "--think");
+    let yes = take_flag(&mut args, "--yes");
     if args.is_empty() || args[0] == "-h" || args[0] == "--help" {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
     let client = Client::new("nyx-ai");
-    match run(&client, &args, json, keep, think).await {
+    match run(&client, &args, Flags { json, keep, think, yes }).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             if json {
@@ -74,7 +78,15 @@ fn need<'a>(args: &'a [String], i: usize, what: &str) -> Result<&'a str, nyx_ai_
     })
 }
 
-async fn run(client: &Client, args: &[String], json: bool, keep: bool, think: bool) -> nyx_ai_client::Result<()> {
+struct Flags {
+    json: bool,
+    keep: bool,
+    think: bool,
+    yes: bool,
+}
+
+async fn run(client: &Client, args: &[String], flags: Flags) -> nyx_ai_client::Result<()> {
+    let Flags { json, keep, think, yes } = flags;
     match args[0].as_str() {
         "status" => {
             let worker = client.worker_status().await?;
@@ -344,6 +356,31 @@ async fn run(client: &Client, args: &[String], json: bool, keep: bool, think: bo
                     println!("  {text}: [{}, …]", head.join(", "));
                 }
             }
+        }
+        "actions" => {
+            let actions = client.list_actions().await?;
+            if json {
+                print_json(&actions);
+            } else if actions.is_empty() {
+                println!("No app offers actions right now.");
+            } else {
+                for a in &actions {
+                    let ask = if a.spec.confirmation == nyx_ai_client::proto::Confirmation::Ask { ", asks first" } else { "" };
+                    let effects = serde_json::to_value(a.spec.side_effects).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+                    println!("{}  ({}; {effects}{ask})\n    {}", a.spec.id, a.owner, a.spec.description);
+                }
+            }
+        }
+        "act" => {
+            let action = need(args, 1, "ACTION")?;
+            let arguments = match args.get(2) {
+                Some(text) => serde_json::from_str(text).map_err(|e| {
+                    nyx_ai_client::proto::Error::new(nyx_ai_client::proto::ErrorKind::InvalidRequest, format!("the arguments aren't JSON: {e}"))
+                })?,
+                None => json!({}),
+            };
+            let result = client.invoke_action(action, arguments, yes).await?;
+            print_json(&result);
         }
         "capabilities" => {
             let c = client.capabilities().await?;
