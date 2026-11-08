@@ -318,6 +318,7 @@ async fn openai_endpoint_for_coding_tools() {
         idle_unload_seconds: None,
         model_updates: None,
         defaults: Some([(role.to_string(), model.to_string())].into()),
+        battery_saver: None,
     };
     let s = h.client.configure_service_with(set("coding", "org/chat:Q4_K_M")).await.unwrap();
     assert_eq!(s.defaults["coding"], "org/chat:Q4_K_M");
@@ -546,5 +547,31 @@ async fn apps_offer_actions_and_calls_are_checked() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert!(gone, "a closed connection withdraws its actions");
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn battery_saver_moves_models_to_the_cpu_on_battery() {
+    let power_dir = tempfile::tempdir().unwrap();
+    power(power_dir.path(), true);
+    let h = Harness::start_with("", None, Some(power_dir.path().to_path_buf())).await;
+    let saver = |on: bool| Op::ConfigureService { max_loaded: None, idle_unload_seconds: None, model_updates: None, defaults: None, battery_saver: Some(on) };
+    h.client.chat(ask("org/chat:Q4_K_M", "hi")).await.unwrap().collect_chat().await.unwrap();
+
+    let s = h.client.configure_service_with(saver(true)).await.unwrap();
+    assert!(s.battery_saver && !s.on_battery && !s.cpu_only);
+    assert_eq!(h.client.resource_status().await.unwrap().loaded.len(), 1, "on mains nothing changes");
+
+    power(power_dir.path(), false);
+    h.service.apply_power().await;
+    let s = h.client.service_settings().await.unwrap();
+    assert!(s.on_battery && s.cpu_only);
+    assert!(std::fs::read_to_string(h.paths.router_ini()).unwrap().contains("n-gpu-layers = 0"));
+    assert!(h.client.resource_status().await.unwrap().loaded.is_empty(), "the idle model unloads to come back on the CPU");
+
+    power(power_dir.path(), true);
+    h.service.apply_power().await;
+    assert!(!h.client.service_settings().await.unwrap().cpu_only);
+    assert!(!std::fs::read_to_string(h.paths.router_ini()).unwrap().contains("n-gpu-layers = 0"));
     h.stop().await;
 }

@@ -33,6 +33,9 @@ pub fn body(req: &ChatRequest, stream: bool) -> Value {
     if let Some(choice) = &req.tool_choice {
         body["tool_choice"] = choice.clone();
     }
+    if let Some(grammar) = &req.grammar {
+        body["grammar"] = json!(grammar);
+    }
     match &req.response_format {
         Some(ResponseFormat::JsonObject) => body["response_format"] = json!({"type": "json_object"}),
         Some(ResponseFormat::JsonSchema { schema }) => body["response_format"] = json!({"type": "json_schema", "schema": schema}),
@@ -166,6 +169,9 @@ mod tests {
         assert!(b.get("reasoning_effort").is_none());
         assert_eq!(b["chat_template_kwargs"]["enable_thinking"], false);
         assert_eq!(b["stream_options"]["include_usage"], true);
+        assert!(b.get("grammar").is_none());
+        let grammar = ChatRequest { model: "m".into(), messages: vec![Message::text(Role::User, "hi")], grammar: Some("root ::= \"a\"".into()), ..Default::default() };
+        assert_eq!(body(&grammar, false)["grammar"], "root ::= \"a\"");
     }
 
     #[test]

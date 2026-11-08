@@ -247,7 +247,7 @@ impl Client {
     }
 
     pub async fn configure_service(&self, max_loaded: Option<u32>, idle_unload_seconds: Option<i64>) -> Result<ServiceSettings> {
-        self.configure_service_with(Op::ConfigureService { max_loaded, idle_unload_seconds, model_updates: None, defaults: None }).await
+        self.configure_service_with(Op::ConfigureService { max_loaded, idle_unload_seconds, model_updates: None, defaults: None, battery_saver: None }).await
     }
 
     /// The actions apps offer.

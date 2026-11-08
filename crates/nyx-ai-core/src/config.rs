@@ -30,6 +30,8 @@ pub struct Settings {
     pub sidecars: Vec<String>,
     /// Default models by role (`chat`, `assistant`, `embedding`, `coding`).
     pub defaults: std::collections::BTreeMap<String, String>,
+    /// On battery, load models on the CPU only.
+    pub battery_saver: bool,
 }
 
 impl Default for Settings {
@@ -44,6 +46,7 @@ impl Default for Settings {
             update_check_hours: 24,
             sidecars: vec!["mmproj".into(), "mtp".into()],
             defaults: Default::default(),
+            battery_saver: false,
         }
     }
 }

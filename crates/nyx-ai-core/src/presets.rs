@@ -251,6 +251,7 @@ pub fn router_ini(
     held: &BTreeMap<String, Option<Vec<String>>>,
     folders: &[FolderEntry],
     embedding: &BTreeSet<String>,
+    cpu_only: bool,
 ) -> String {
     let mut out = ini.clone();
     for (name, old) in held {
@@ -269,6 +270,13 @@ pub fn router_ini(
     for id in embedding {
         if !out.effective(id).contains_key("embeddings") {
             out.lines_mut(id).push("embeddings = true".into());
+        }
+    }
+    if cpu_only {
+        let cpu: BTreeMap<String, String> = [("n-gpu-layers".to_string(), "0".to_string())].into();
+        let names: Vec<String> = out.names().map(str::to_string).chain(["*".to_string()]).collect();
+        for name in names {
+            let _ = out.set(&name, &cpu);
         }
     }
     out.render()
@@ -336,9 +344,24 @@ mod tests {
         ini.set("busy", &changes(&[("ctx-size", "999")])).unwrap();
         let held = [("busy".to_string(), None)].into();
         let folders = [FolderEntry { id: "local".into(), path: "/m/a.gguf".into(), mmproj: Some("/m/mmproj-a.gguf".into()) }];
-        let text = router_ini(&ini, &held, &folders, &["embed".to_string()].into());
+        let text = router_ini(&ini, &held, &folders, &["embed".to_string()].into(), false);
         assert!(!text.contains("[busy]"));
         assert!(text.contains("[local]\nmodel = /m/a.gguf\nmmproj = /m/mmproj-a.gguf"));
         assert!(text.contains("[embed]\nembeddings = true"));
+        assert!(!text.contains("n-gpu-layers = 0"));
+    }
+
+    #[test]
+    fn battery_saver_puts_every_model_on_the_cpu() {
+        let mut ini = Ini::parse(DEFAULTS);
+        ini.set("big", &changes(&[("n-gpu-layers", "all"), ("ctx-size", "8192")])).unwrap();
+        let folders = [FolderEntry { id: "local".into(), path: "/m/a.gguf".into(), mmproj: None }];
+        let text = router_ini(&ini, &Default::default(), &folders, &Default::default(), true);
+        let cpu = Ini::parse(&text);
+        for name in ["*", "big", "local"] {
+            assert_eq!(cpu.effective(name)["n-gpu-layers"], "0", "{name}: {text}");
+        }
+        assert_eq!(cpu.effective("big")["ctx-size"], "8192");
+        assert_eq!(ini.effective("big")["n-gpu-layers"], "all", "the saved settings stay");
     }
 }

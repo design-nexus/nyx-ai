@@ -61,6 +61,8 @@ struct PresetState {
     waiting: BTreeMap<String, BTreeSet<String>>,
     /// Embedding models written into the router's file.
     embedding: BTreeSet<String>,
+    /// Battery saver on battery: every model loads with no GPU layers.
+    cpu_only: bool,
     written: Option<String>,
 }
 
@@ -185,6 +187,8 @@ pub struct Service {
     switch_lock: tokio::sync::Mutex<()>,
     started: Instant,
     actions: Actions,
+    /// Models loaded before the last CPU-only switch, unloaded once idle.
+    power_stale: Mutex<BTreeSet<String>>,
 }
 
 const PRIVILEGED: &[&str] = &["remove_model", "configure_model", "configure_service", "serve_actions"];
@@ -253,6 +257,7 @@ impl Service {
                 switch_lock: tokio::sync::Mutex::new(()),
                 started: Instant::now(),
                 actions: Actions::default(),
+                power_stale: Mutex::default(),
             }
         })
     }
@@ -278,6 +283,7 @@ impl Service {
                         me.scheduler.tick(pressure).await;
                         me.apply_staged().await;
                         me.auto_update();
+                        me.apply_power().await;
                     }
                 }
             }
@@ -311,7 +317,7 @@ impl Service {
 
     fn write_router_ini(&self, folders: &[presets::FolderEntry]) -> Result<bool, Error> {
         let mut presets = self.shared.presets.lock().expect("presets");
-        let text = presets::router_ini(&presets.ini, &presets.held, folders, &presets.embedding);
+        let text = presets::router_ini(&presets.ini, &presets.held, folders, &presets.embedding, presets.cpu_only);
         if presets.written.as_deref() == Some(text.as_str()) && self.shared.paths.router_ini().exists() {
             return Ok(false);
         }
@@ -504,8 +510,13 @@ impl Service {
             Op::ListCapabilities {} => Ok(Reply::Capabilities(self.capabilities())),
             Op::ServiceSettings {} => Ok(Reply::Service(self.service_settings())),
             Op::CheckUpdates {} => Ok(Reply::Models { models: self.check_updates().await }),
-            Op::ConfigureService { max_loaded, idle_unload_seconds, model_updates, defaults } => {
-                self.configure_service(max_loaded, idle_unload_seconds, model_updates, defaults).await.map(Reply::Service)
+            Op::ConfigureService { max_loaded, idle_unload_seconds, model_updates, defaults, battery_saver } => {
+                let settings = self.configure_service(max_loaded, idle_unload_seconds, model_updates, defaults, battery_saver).await?;
+                if battery_saver.is_some() {
+                    self.apply_power().await;
+                    return Ok(Reply::Service(self.service_settings()));
+                }
+                Ok(Reply::Service(settings))
             }
             Op::ListActions {} => Ok(Reply::Actions { actions: self.actions.list().await }),
             Op::InvokeAction { action, arguments, confirmed } => self
@@ -988,7 +999,7 @@ impl Service {
         if mode != "auto" {
             return;
         }
-        let power = self.options.power_supply.clone().unwrap_or_else(|| "/sys/class/power_supply".into());
+        let power = self.power_supply();
         let busy = self.metrics.active.load(Ordering::Relaxed) > 0;
         if busy || !crate::updates::on_ac(&power) {
             let paused = self.downloads.pause_auto();
@@ -1117,6 +1128,41 @@ impl Service {
             openai_endpoint: s.openai_addr().map(|a| a.to_string()),
             model_updates: Some(s.model_updates.clone()),
             defaults: s.defaults.clone(),
+            battery_saver: s.battery_saver,
+            on_battery: !crate::updates::on_ac(&self.power_supply()),
+            cpu_only: self.shared.presets.lock().expect("presets").cpu_only,
+        }
+    }
+
+    fn power_supply(&self) -> std::path::PathBuf {
+        self.options.power_supply.clone().unwrap_or_else(|| "/sys/class/power_supply".into())
+    }
+
+    /// Battery saver: on battery every model loads on the CPU; models loaded the
+    /// other way unload once idle and come back the new way on their next use.
+    pub async fn apply_power(&self) {
+        let cpu_only = self.settings.lock().expect("settings").battery_saver && !crate::updates::on_ac(&self.power_supply());
+        let switched = {
+            let mut presets = self.shared.presets.lock().expect("presets");
+            std::mem::replace(&mut presets.cpu_only, cpu_only) != cpu_only
+        };
+        if switched {
+            tracing::info!(cpu_only, "battery saver");
+            let loaded: Vec<String> = self.scheduler.loaded_models().into_iter().map(|m| m.id).collect();
+            self.power_stale.lock().expect("power").extend(loaded);
+            if let Err(e) = self.refresh(true).await {
+                tracing::debug!(error = %e, "router not refreshed after a power change");
+            }
+        }
+        let stale: Vec<String> = self.power_stale.lock().expect("power").iter().cloned().collect();
+        if stale.is_empty() {
+            return;
+        }
+        let loaded: BTreeSet<String> = self.scheduler.loaded_models().into_iter().map(|m| m.id).collect();
+        for id in stale {
+            if !loaded.contains(&id) || self.scheduler.unload_if_idle(&id).await.unwrap_or(false) {
+                self.power_stale.lock().expect("power").remove(&id);
+            }
         }
     }
 
@@ -1126,6 +1172,7 @@ impl Service {
         idle: Option<i64>,
         updates: Option<String>,
         defaults: Option<BTreeMap<String, String>>,
+        battery_saver: Option<bool>,
     ) -> Result<ServiceSettings, Error> {
         let invalid = |m: String| Error::new(ErrorKind::InvalidRequest, m);
         if max_loaded.is_some_and(|n| !(1..=crate::config::MAX_LOADED_LIMIT).contains(&n)) {
@@ -1168,6 +1215,9 @@ impl Service {
         }
         if let Some(n) = max_loaded {
             settings.max_loaded = n;
+        }
+        if let Some(b) = battery_saver {
+            settings.battery_saver = b;
         }
         if let Some(n) = idle {
             settings.idle_unload_seconds = n;

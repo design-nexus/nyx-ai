@@ -55,7 +55,7 @@ daemon. Lines are at most 64 MiB. A connection may have 32 requests open.
 | `worker_status` | | | `worker` |
 | `list_capabilities` | | | `capabilities` |
 | `service_settings` | | | `service` |
-| `configure_service` | `max_loaded`, `idle_unload_seconds`, `model_updates`, `defaults` (`{role: model}`, `""` clears) (all optional) | | `service` |
+| `configure_service` | `max_loaded`, `idle_unload_seconds`, `model_updates`, `defaults` (`{role: model}`, `""` clears), `battery_saver` (all optional) | | `service` |
 | `check_updates` | | | `models` (those with `update_available`) |
 | `list_actions` | | | `actions` |
 | `invoke_action` | `action`, `arguments` (JSON), `confirmed` | | `action_done` (`result`) |
@@ -98,6 +98,8 @@ drops its partial files.
  "reasoning_effort": "high", "thinking": true, "priority": "interactive"}
 ```
 
+- `grammar` is a GBNF grammar (llama.cpp's format, up to 64 KB) the reply must
+  follow. It can't go with `tools` or `response_format`.
 - Images must be `data:image/…;base64,` URLs and need a model with `vision`;
   `input_audio` needs `audio`. Otherwise `unsupported_capability`.
 - `priority` is `interactive`, `normal` (default) or `background`.
@@ -226,6 +228,17 @@ shape (`{"error": {"code", "message", "type"}}`).
 - Version 1, additions: image and audio `embed` inputs; `ModelIdentity.projector`
   and `settings`; the settings keys `pooling`, `batch-size`, `ubatch-size`,
   `image-min-tokens` and `image-max-tokens`.
+- Version 1, additions: `ChatRequest.grammar`; `configure_service`'s
+  `battery_saver`; `ServiceSettings.battery_saver`, `on_battery` and `cpu_only`.
+
+## Battery saver
+
+With `battery_saver` on, AI Core reads `/sys/class/power_supply` every 15 s. On
+battery every model loads with no GPU layers (the saved settings in
+`models.ini` stay as they are); models loaded the other way unload once idle and
+load the new way on their next request, and the same happens back on mains
+power. `service` reports `battery_saver`, `on_battery` and `cpu_only` (models load
+on the CPU now). Apps choose shorter replies themselves.
 
 ## Default models
 

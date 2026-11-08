@@ -57,7 +57,8 @@ let reply = client.chat(request).await?.collect_chat().await?;
 ```
 
 Depend on `nyx-ai-client` by Git revision. `docs/GLIMPSE.md` covers embedding
-text, images and audio for semantic search.
+text, images and audio for semantic search; `docs/ASSISTANT.md` covers the
+Assistant and Notes (grammars, battery saver, actions, scheduling).
 
 ## Actions
 

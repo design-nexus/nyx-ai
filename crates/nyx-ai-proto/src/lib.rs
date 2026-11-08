@@ -19,6 +19,9 @@ pub const API_VERSION: u32 = 1;
 /// The longest line either side accepts (a chat with a few images fits).
 pub const MAX_LINE: usize = 64 << 20;
 
+/// The longest GBNF grammar a chat may carry.
+pub const MAX_GRAMMAR: usize = 64 << 10;
+
 /// The socket's name inside `$XDG_RUNTIME_DIR/nyx-ai/`.
 pub const SOCKET_NAME: &str = "ai.sock";
 
@@ -178,6 +181,9 @@ pub enum Op {
         /// Default models by role (see [`ROLES`]); an empty model clears a role.
         #[serde(default)]
         defaults: Option<BTreeMap<String, String>>,
+        /// On battery, run models on the CPU only.
+        #[serde(default)]
+        battery_saver: Option<bool>,
     },
 }
 
@@ -254,6 +260,10 @@ pub struct ChatRequest {
     pub tool_choice: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_format: Option<ResponseFormat>,
+    /// A GBNF grammar the reply must follow (llama.cpp's format). Not with `tools`
+    /// or `response_format`, which become grammars of their own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grammar: Option<String>,
     #[serde(default, skip_serializing_if = "Sampling::is_empty")]
     pub sampling: Sampling,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -485,6 +495,14 @@ impl ChatRequest {
             && !schema.is_object()
         {
             return Err("response_format schema must be an object".into());
+        }
+        if let Some(grammar) = &self.grammar {
+            if grammar.trim().is_empty() || grammar.len() > MAX_GRAMMAR {
+                return Err(format!("a grammar must be between 1 byte and {} KB", MAX_GRAMMAR >> 10));
+            }
+            if !self.tools.is_empty() || self.response_format.is_some() {
+                return Err("a grammar can't go with tools or response_format".into());
+            }
         }
         if let Some(effort) = &self.reasoning_effort
             && !REASONING_EFFORTS.contains(&effort.as_str())
@@ -973,6 +991,15 @@ pub struct ServiceSettings {
     /// Default models by role.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub defaults: BTreeMap<String, String>,
+    /// On battery, models run on the CPU only.
+    #[serde(default)]
+    pub battery_saver: bool,
+    /// The computer runs on its battery now.
+    #[serde(default)]
+    pub on_battery: bool,
+    /// Models load on the CPU only now (battery saver on battery).
+    #[serde(default)]
+    pub cpu_only: bool,
 }
 
 // ---------- Errors ----------
@@ -1072,6 +1099,7 @@ mod tests {
                 idle_unload_seconds: None,
                 model_updates: Some("notify".into()),
                 defaults: Some([("chat".to_string(), "org/m:Q4_K_M".to_string())].into()),
+                battery_saver: Some(true),
             },
             Op::CheckUpdates {},
         ];
@@ -1119,6 +1147,14 @@ mod tests {
     fn validation() {
         let mut r = ChatRequest { model: "m".into(), messages: vec![Message::text(Role::User, "x")], ..Default::default() };
         r.validate().unwrap();
+        r.grammar = Some(r#"root ::= "yes" | "no""#.into());
+        r.validate().unwrap();
+        r.response_format = Some(ResponseFormat::JsonObject);
+        assert!(r.validate().unwrap_err().contains("grammar"));
+        r.response_format = None;
+        r.grammar = Some(" ".into());
+        assert!(r.validate().is_err());
+        r.grammar = None;
         r.sampling.temperature = Some(9.0);
         assert!(r.validate().is_err());
         r.sampling.temperature = None;

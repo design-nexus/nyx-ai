@@ -21,9 +21,10 @@ const USAGE: &str = "Usage: nyx-ai COMMAND [--json]
   load MODEL [--keep]          load now (--keep: until unload)
   unload MODEL                 unload unless something else uses it
   settings MODEL|* [KEY=VALUE…] show or change load-time settings (empty value removes)
-  service [max_loaded=N] [idle=SECONDS] [updates=auto|notify|off]
+  service [max_loaded=N] [idle=SECONDS] [updates=auto|notify|off] [battery_saver=on|off]
                                show or change how many models stay loaded, for how long,
-                               and whether models update themselves
+                               whether models update themselves, and whether they run on
+                               the CPU on battery
   default ROLE [MODEL]         show or set the default model for a role (chat, assistant,
                                embedding, coding); \"\" clears it
   chat MODEL PROMPT…           ask a model (--think to show its reasoning)
@@ -238,15 +239,17 @@ async fn run(client: &Client, args: &[String], flags: Flags) -> nyx_ai_client::R
             let mut max = None;
             let mut idle = None;
             let mut updates = None;
+            let mut saver = None;
             for kv in &args[1..] {
                 match kv.split_once('=') {
                     Some(("max_loaded", v)) => max = v.parse().ok(),
                     Some(("idle", v)) | Some(("idle_unload_seconds", v)) => idle = v.parse().ok(),
                     Some(("updates", v)) | Some(("model_updates", v)) => updates = Some(v.to_string()),
+                    Some(("battery_saver", v)) => saver = Some(matches!(v, "on" | "true" | "yes" | "1")),
                     _ => {}
                 }
             }
-            let s = if max.is_none() && idle.is_none() && updates.is_none() {
+            let s = if max.is_none() && idle.is_none() && updates.is_none() && saver.is_none() {
                 client.service_settings().await?
             } else {
                 client
@@ -255,6 +258,7 @@ async fn run(client: &Client, args: &[String], flags: Flags) -> nyx_ai_client::R
                         idle_unload_seconds: idle,
                         model_updates: updates,
                         defaults: None,
+                        battery_saver: saver,
                     })
                     .await?
             };
@@ -263,6 +267,12 @@ async fn run(client: &Client, args: &[String], flags: Flags) -> nyx_ai_client::R
             } else {
                 println!("max_loaded = {}\nidle_unload_seconds = {}\nmodel_dirs = {}", s.max_loaded, s.idle_unload_seconds, s.model_dirs.join(", "));
                 println!("model_updates = {}", s.model_updates.as_deref().unwrap_or("auto"));
+                let now = match (s.on_battery, s.cpu_only) {
+                    (_, true) => "on battery: models run on the CPU",
+                    (true, false) => "on battery",
+                    (false, false) => "on mains power",
+                };
+                println!("battery_saver = {}  ({now})", if s.battery_saver { "on" } else { "off" });
                 for (role, model) in &s.defaults {
                     println!("default.{role} = {model}");
                 }
@@ -283,6 +293,7 @@ async fn run(client: &Client, args: &[String], flags: Flags) -> nyx_ai_client::R
                             idle_unload_seconds: None,
                             model_updates: None,
                             defaults: Some([(role.clone(), model.clone())].into()),
+                            battery_saver: None,
                         })
                         .await?
                 }

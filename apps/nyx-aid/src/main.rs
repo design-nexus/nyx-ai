@@ -30,7 +30,7 @@ fn main() -> ExitCode {
     let options = Options {
         allow_untrusted: std::env::var("NYX_AI_ALLOW_UNTRUSTED").is_ok_and(|v| v == "1"),
         worker: std::env::var_os("NYX_AI_WORKER").filter(|v| !v.is_empty()).map(Into::into),
-        power_supply: None,
+        power_supply: std::env::var_os("NYX_AI_POWER_SUPPLY").filter(|v| !v.is_empty()).map(Into::into),
         hf_endpoint: None,
         update_idle_secs: None,
     };
