@@ -1,0 +1,21 @@
+{
+  "application": "ai",
+  "directory": "nyx-ai",
+  "packages": [
+    "nyx-aid",
+    "nyx-ai"
+  ],
+  "manifest": "Cargo.toml",
+  "prepare": [],
+  "binaries": [
+    "nyx-aid",
+    "nyx-ai"
+  ],
+  "test_commands": [
+    [
+      "cargo",
+      "test",
+      "--locked"
+    ]
+  ]
+}

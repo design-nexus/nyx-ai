@@ -1,0 +1,10 @@
+[Unit]
+Description=Nyx AI Core socket (starts the shared model runtime on first use)
+
+[Socket]
+ListenStream=%t/nyx-ai/ai.sock
+SocketMode=0600
+DirectoryMode=0700
+
+[Install]
+WantedBy=sockets.target

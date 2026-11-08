@@ -1,0 +1,867 @@
+//! One handler per operation, over the registry, presets, worker, scheduler and
+//! downloads.
+
+use crate::config::Settings;
+use crate::diagnostics::Metrics;
+use crate::downloads::Downloads;
+use crate::paths::{self, Paths};
+use crate::presets::{self, Ini};
+use crate::registry::{Record, Registry, RouterItem};
+use crate::resources;
+use crate::scheduler::{Backend, Load, Scheduler};
+use crate::stream::{self, Sse};
+use crate::worker::{self, Worker, encode_query};
+use futures_util::future::BoxFuture;
+use hyper::Method;
+use nyx_ai_proto::{
+    Capabilities, Capability, ChatRequest, Download, DownloadState, Embeddings, Error, ErrorKind, Event, Finished, Model, ModelDetail,
+    ModelIdentity, ModelSettings, ModelState, OPERATIONS, Op, Priority, REASONING_EFFORTS, Reply, ResourceStatus, ServiceSettings, Source,
+    Timings, WorkerStatus, valid_model_id,
+};
+use serde_json::{Value, json};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+
+/// Who's asking.
+#[derive(Clone, Debug)]
+pub struct Caller {
+    /// The trusted program's name, or `untrusted:<declared name>`.
+    pub name: String,
+    pub trusted: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Options {
+    /// Let untrusted callers remove models and change settings (test copies).
+    pub allow_untrusted: bool,
+    /// Use this llama-server instead of the configured or installed one.
+    pub worker: Option<std::path::PathBuf>,
+}
+
+#[derive(Default)]
+struct PresetState {
+    ini: Ini,
+    /// Sections as they were before a change that waits for busy models.
+    held: BTreeMap<String, Option<Vec<String>>>,
+    /// The busy models each held change waits for.
+    waiting: BTreeMap<String, BTreeSet<String>>,
+    /// Embedding models written into the router's file.
+    embedding: BTreeSet<String>,
+    written: Option<String>,
+}
+
+struct Shared {
+    paths: Paths,
+    worker: Arc<Worker>,
+    registry: Registry,
+    presets: Mutex<PresetState>,
+}
+
+impl Shared {
+    fn context_for(&self, model: &str) -> (u64, String) {
+        let (effective, meta_ctx) = {
+            let presets = self.presets.lock().expect("presets");
+            (presets.ini.effective(model), self.registry.get(model).and_then(|r| r.meta.and_then(|m| m.context_length)))
+        };
+        let ctx = effective.get("ctx-size").and_then(|v| v.parse::<u64>().ok()).filter(|c| *c > 0);
+        let ctx = ctx.unwrap_or_else(|| meta_ctx.unwrap_or(8192).min(32768));
+        (ctx, effective.get("cache-type-k").cloned().unwrap_or_else(|| "f16".into()))
+    }
+}
+
+/// The scheduler's view of the worker.
+struct WorkerBackend(Arc<Shared>);
+
+fn status_of(list: &Value, model: &str) -> Option<RouterItem> {
+    list["data"].as_array()?.iter().filter_map(RouterItem::parse).find(|i| i.id == model)
+}
+
+impl Backend for WorkerBackend {
+    fn load(&self, model: String) -> BoxFuture<'static, Result<usize, Error>> {
+        let shared = self.0.clone();
+        Box::pin(async move {
+            let http = shared.worker.ready().await?;
+            let generation = shared.worker.generation();
+            match http.post("/models/load", &json!({"model": model})).await {
+                Ok(_) => {}
+                Err(e) if e.message.contains("already") => {}
+                Err(e) => return Err(Error::new(ErrorKind::ModelLoadFailed, e.message)),
+            }
+            let started = Instant::now();
+            loop {
+                if shared.worker.generation() != generation {
+                    return Err(Error::new(ErrorKind::WorkerFailed, "llama.cpp restarted while loading the model"));
+                }
+                let list = http.get("/models").await?;
+                let Some(item) = status_of(&list, &model) else {
+                    return Err(Error::new(ErrorKind::UnknownModel, format!("llama.cpp doesn't list {model}")));
+                };
+                match item.status.as_str() {
+                    "loaded" => break,
+                    "loading" => {}
+                    _ if item.failed.is_some() => {
+                        let detail = shared.worker.load_error().map(|e| format!(": {e}")).unwrap_or_default();
+                        return Err(Error::new(ErrorKind::ModelLoadFailed, format!("{}{detail}", item.failed.unwrap_or_default())));
+                    }
+                    _ if started.elapsed() > Duration::from_secs(15) => {
+                        return Err(Error::new(ErrorKind::ModelLoadFailed, format!("llama.cpp didn't start loading {model}")));
+                    }
+                    _ => {}
+                }
+                if started.elapsed() > Duration::from_secs(900) {
+                    return Err(Error::new(ErrorKind::Timeout, format!("{model} took more than 15 minutes to load")));
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            let props = http.get(&format!("/props?model={}", encode_query(&model))).await.unwrap_or_default();
+            Ok(props["total_slots"].as_u64().unwrap_or(1).max(1) as usize)
+        })
+    }
+
+    fn unload(&self, model: String) -> BoxFuture<'static, Result<(), Error>> {
+        let shared = self.0.clone();
+        Box::pin(async move {
+            let http = shared.worker.ready().await?;
+            if let Err(e) = http.post("/models/unload", &json!({"model": model})).await
+                && !e.message.contains("not")
+            {
+                return Err(e);
+            }
+            let started = Instant::now();
+            while started.elapsed() < Duration::from_secs(30) {
+                let list = http.get("/models").await?;
+                if status_of(&list, &model).is_none_or(|i| !matches!(i.status.as_str(), "loaded" | "loading")) {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(Error::new(ErrorKind::Timeout, format!("{model} didn't unload")))
+        })
+    }
+
+    fn estimate(&self, model: &str) -> u64 {
+        let size = self.weights(model);
+        let (ctx, kv) = self.0.context_for(model);
+        resources::needed(size, ctx, &kv)
+    }
+
+    fn weights(&self, model: &str) -> u64 {
+        self.0.registry.get(model).map(|r| r.size).unwrap_or(0)
+    }
+
+    fn memory(&self) -> (u64, u64) {
+        let mem = resources::detect();
+        (resources::budget(mem), mem.vram + mem.ram)
+    }
+}
+
+pub struct Service {
+    shared: Arc<Shared>,
+    settings: Mutex<Settings>,
+    scheduler: Arc<Scheduler>,
+    downloads: Arc<Downloads>,
+    metrics: Arc<Metrics>,
+    options: Options,
+    router_status: Mutex<HashMap<String, String>>,
+    seen_generation: AtomicU64,
+    refresh_lock: tokio::sync::Mutex<()>,
+}
+
+const PRIVILEGED: &[&str] = &["remove_model", "configure_model", "configure_service"];
+
+impl Service {
+    pub fn new(paths: Paths, options: Options) -> Arc<Service> {
+        let settings = Settings::load(&paths);
+        for dir in [&paths.config, &paths.state, &paths.own_models()] {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let program = options
+            .worker
+            .clone()
+            .filter(|p| p.is_file())
+            .or_else(|| worker::find_program(settings.worker.as_deref(), &paths.lib));
+        let worker = Worker::new(worker::Config {
+            program,
+            preset: paths.router_ini(),
+            socket: paths.worker_socket(),
+            key_file: paths.worker_key(),
+            cache: paths.cache.clone(),
+            max_models: crate::config::MAX_LOADED_LIMIT * 2,
+        });
+        let shared = Arc::new(Shared {
+            registry: Registry::load(&paths),
+            presets: Mutex::new(PresetState { ini: presets::load_or_import(&paths), ..Default::default() }),
+            worker,
+            paths: paths.clone(),
+        });
+        let metrics = Arc::new(Metrics::default());
+        let scheduler = Scheduler::new(Arc::new(WorkerBackend(shared.clone())), settings.max_loaded, settings.idle_unload_seconds, metrics.clone());
+        Arc::new_cyclic(|me: &Weak<Service>| {
+            let on_done = me.clone();
+            let downloads = Downloads::new(paths.cache.clone(), paths.config_home.clone(), move || {
+                if let Some(service) = on_done.upgrade() {
+                    tokio::spawn(async move {
+                        let _ = service.refresh(true).await;
+                    });
+                }
+            });
+            let on_idle = me.clone();
+            scheduler.on_idle(move |model| {
+                if let Some(service) = on_idle.upgrade() {
+                    tokio::spawn(async move { service.apply_held(&model).await });
+                }
+            });
+            Service {
+                shared,
+                settings: Mutex::new(settings),
+                scheduler,
+                downloads,
+                metrics,
+                options,
+                router_status: Mutex::new(HashMap::new()),
+                seen_generation: AtomicU64::new(0),
+                refresh_lock: tokio::sync::Mutex::new(()),
+            }
+        })
+    }
+
+    pub fn paths(&self) -> &Paths {
+        &self.shared.paths
+    }
+
+    /// Idle unloading, memory pressure and worker restarts, until `stop`.
+    pub fn run_background(self: &Arc<Self>, stop: CancellationToken) {
+        let me = self.clone();
+        tokio::spawn(async move {
+            let mut changes = me.shared.worker.subscribe();
+            let mut tick = tokio::time::interval(Duration::from_secs(15));
+            loop {
+                tokio::select! {
+                    _ = stop.cancelled() => break,
+                    _ = changes.changed() => me.check_generation(),
+                    _ = tick.tick() => {
+                        me.check_generation();
+                        let total = resources::detect().ram;
+                        let pressure = resources::under_pressure(total, resources::available_ram(), resources::memory_pressure());
+                        me.scheduler.tick(pressure).await;
+                    }
+                }
+            }
+        });
+    }
+
+    fn check_generation(&self) {
+        let now = self.shared.worker.generation();
+        let seen = self.seen_generation.swap(now, Ordering::SeqCst);
+        if now != seen {
+            if seen != 0 {
+                Metrics::inc(&self.metrics.worker_restarts);
+            }
+            self.scheduler.reset();
+            self.shared.presets.lock().expect("presets").written = None;
+        }
+    }
+
+    pub async fn shutdown(&self) {
+        self.shared.worker.shutdown().await;
+    }
+
+    pub fn authorize(&self, caller: &Caller, op: &Op) -> Result<(), Error> {
+        if !caller.trusted && !self.options.allow_untrusted && PRIVILEGED.contains(&op.name()) {
+            return Err(Error::new(ErrorKind::PermissionDenied, format!("{} may not {}", caller.name, op.name().replace('_', " "))));
+        }
+        Ok(())
+    }
+
+    // ---------- The model list ----------
+
+    fn write_router_ini(&self, folders: &[presets::FolderEntry]) -> Result<bool, Error> {
+        let mut presets = self.shared.presets.lock().expect("presets");
+        let text = presets::router_ini(&presets.ini, &presets.held, folders, &presets.embedding);
+        if presets.written.as_deref() == Some(text.as_str()) && self.shared.paths.router_ini().exists() {
+            return Ok(false);
+        }
+        paths::write_atomic(&self.shared.paths.router_ini(), text.as_bytes())
+            .map_err(|e| Error::new(ErrorKind::Internal, format!("couldn't write the router presets: {e}")))?;
+        presets.written = Some(text);
+        Ok(true)
+    }
+
+    /// Ask the router for its models, after updating its presets.
+    pub async fn refresh(&self, reload: bool) -> Result<BTreeMap<String, Record>, Error> {
+        let _guard = self.refresh_lock.lock().await;
+        if self.shared.worker.program().is_none() {
+            return Err(Error::new(ErrorKind::WorkerUnavailable, "llama.cpp isn't installed"));
+        }
+        let dirs = self.settings.lock().expect("settings").model_dirs();
+        let folders = self.shared.registry.scan_folders(&dirs, &self.shared.paths.cache);
+        let mut reload = self.write_router_ini(&folders)? || reload;
+        let http = self.shared.worker.ready().await?;
+        self.check_generation();
+        for _ in 0..2 {
+            let list = http.get(if reload { "/models?reload=1" } else { "/models" }).await?;
+            let items: Vec<RouterItem> = list["data"].as_array().into_iter().flatten().filter_map(RouterItem::parse).collect();
+            let loaded: HashSet<String> = items.iter().filter(|i| matches!(i.status.as_str(), "loaded" | "loading")).map(|i| i.id.clone()).collect();
+            self.scheduler.sync(&loaded);
+            *self.router_status.lock().expect("status") = items.iter().map(|i| (i.id.clone(), i.status.clone())).collect();
+            let records = self.shared.registry.update(&items);
+            let embedding: BTreeSet<String> =
+                records.iter().filter(|(_, r)| !r.missing && r.capabilities().contains(&Capability::Embedding)).map(|(id, _)| id.clone()).collect();
+            let changed = {
+                let mut presets = self.shared.presets.lock().expect("presets");
+                let changed = presets.embedding != embedding;
+                presets.embedding = embedding;
+                changed
+            };
+            if !changed || !self.write_router_ini(&folders)? {
+                return Ok(records);
+            }
+            reload = true;
+        }
+        Ok(self.shared.registry.known())
+    }
+
+    async fn records(&self) -> BTreeMap<String, Record> {
+        match self.refresh(false).await {
+            Ok(records) => records,
+            Err(e) => {
+                tracing::debug!(error = %e, "listing models from the registry");
+                self.shared.registry.known()
+            }
+        }
+    }
+
+    fn model(&self, id: &str, record: &Record) -> Model {
+        let meta = record.meta.as_ref();
+        let view = self.scheduler.view(id);
+        let router = self.router_status.lock().expect("status").get(id).cloned().unwrap_or_default();
+        let state = if record.missing {
+            ModelState::Missing
+        } else if self.downloads.active(id) || router == "downloading" {
+            ModelState::Downloading
+        } else {
+            match view {
+                Some((Load::Loading, ..)) => ModelState::Loading,
+                Some((Load::Unloading, ..)) => ModelState::Unloading,
+                Some((Load::Loaded, active, ..)) => {
+                    if active > 0 {
+                        ModelState::Busy
+                    } else {
+                        ModelState::Ready
+                    }
+                }
+                _ if router == "loading" => ModelState::Loading,
+                _ if record.error.is_some() => ModelState::Failed,
+                _ => ModelState::Installed,
+            }
+        };
+        Model {
+            id: id.into(),
+            name: meta.and_then(|m| m.name.clone()).unwrap_or_else(|| id.into()),
+            source: record.source,
+            path: record.path.as_ref().map(|p| p.display().to_string()),
+            size: record.size,
+            architecture: meta.and_then(|m| m.architecture.clone()),
+            quantization: record.quantization(),
+            parameters: meta.and_then(|m| m.size_label.clone()),
+            context_length: meta.and_then(|m| m.context_length),
+            capabilities: record.capabilities(),
+            state,
+            revision: record.revision.clone(),
+            pinned: view.is_some_and(|v| v.2),
+            removable: record.source == Source::Cache,
+            pending_settings: view.is_some_and(|v| v.3),
+            error: record.error.clone(),
+        }
+    }
+
+    async fn list_models(&self) -> Vec<Model> {
+        let records = self.records().await;
+        let mut models: Vec<Model> = records.iter().map(|(id, r)| self.model(id, r)).collect();
+        for d in self.downloads.list() {
+            if matches!(d.state, DownloadState::Queued | DownloadState::Running) && !records.contains_key(&d.model) {
+                models.push(Model {
+                    id: d.model.clone(),
+                    name: d.model.clone(),
+                    source: Source::Cache,
+                    path: None,
+                    size: d.total,
+                    architecture: None,
+                    quantization: None,
+                    parameters: None,
+                    context_length: None,
+                    capabilities: Vec::new(),
+                    state: ModelState::Downloading,
+                    revision: None,
+                    pinned: false,
+                    removable: false,
+                    pending_settings: false,
+                    error: None,
+                });
+            }
+        }
+        models.sort_by(|a, b| a.id.cmp(&b.id));
+        models
+    }
+
+    /// A model that can run, with its capabilities.
+    async fn usable(&self, id: &str) -> Result<(Record, Vec<Capability>), Error> {
+        valid_model_id(id).map_err(|e| Error::new(ErrorKind::InvalidRequest, e))?;
+        let mut record = self.shared.registry.get(id);
+        if record.is_none() {
+            record = self.records().await.remove(id);
+        }
+        let record = record.ok_or_else(|| Error::new(ErrorKind::UnknownModel, format!("{id} isn't installed")))?;
+        if record.missing {
+            return Err(Error::new(ErrorKind::UnknownModel, format!("{id}'s file is gone")));
+        }
+        let caps = record.capabilities();
+        if caps == [Capability::Draft] {
+            return Err(Error::new(ErrorKind::UnsupportedCapability, format!("{id} is only a companion drafter")));
+        }
+        Ok((record, caps))
+    }
+
+    // ---------- Operations ----------
+
+    pub async fn handle(&self, caller: &Caller, op: Op, events: mpsc::Sender<Event>, cancel: CancellationToken) -> Result<Reply, Error> {
+        match op {
+            Op::ListModels {} => Ok(Reply::Models { models: self.list_models().await }),
+            Op::ModelInfo { model } => self.model_info(&model).await.map(|d| Reply::ModelInfo(Box::new(d))),
+            Op::LoadModel { model, keep } => {
+                self.usable(&model).await?;
+                if keep {
+                    self.scheduler.pin(&model, &caller.name);
+                }
+                let _ = events.send(Event::ModelLoading { model: model.clone() }).await;
+                self.scheduler.load(&model, Priority::Normal, &cancel).await?;
+                Ok(Reply::Loaded { model })
+            }
+            Op::UnloadModel { model } => {
+                valid_model_id(&model).map_err(|e| Error::new(ErrorKind::InvalidRequest, e))?;
+                let unloaded = self.scheduler.release(&model, &caller.name).await?;
+                Ok(Reply::Unloaded { model, unloaded })
+            }
+            Op::RemoveModel { model } => self.remove(&model).await.map(|_| Reply::Ok),
+            Op::ModelSettings { model } => self.settings_of(&model).map(Reply::Settings),
+            Op::ConfigureModel { model, settings } => self.configure(&model, &settings).await.map(Reply::Settings),
+            Op::DownloadModel { model } => self.download(&model, &events, &cancel).await.map(|_| Reply::Ok),
+            Op::CancelDownload { model } => {
+                if self.downloads.cancel(&model) {
+                    Ok(Reply::Ok)
+                } else {
+                    Err(Error::new(ErrorKind::UnknownRequest, format!("{model} isn't downloading")))
+                }
+            }
+            Op::Downloads {} => Ok(Reply::Downloads { downloads: self.downloads.list() }),
+            Op::Chat(request) => self.counted(self.chat(caller, request, &events, &cancel)).await.map(Reply::Finished),
+            Op::Embed { model, input, priority } => {
+                self.counted(self.embed(caller, &model, input, priority, &events, &cancel)).await.map(Reply::Embeddings)
+            }
+            Op::ApplyTemplate(request) => self.counted(self.apply_template(caller, request, &cancel)).await.map(|prompt| Reply::Template { prompt }),
+            Op::Cancel { .. } => Err(Error::new(ErrorKind::InvalidRequest, "cancel is handled by the connection")),
+            Op::ResourceStatus {} => Ok(Reply::Resources(self.resource_status())),
+            Op::WorkerStatus {} => Ok(Reply::Worker(self.worker_status())),
+            Op::ListCapabilities {} => Ok(Reply::Capabilities(self.capabilities())),
+            Op::ServiceSettings {} => Ok(Reply::Service(self.service_settings())),
+            Op::ConfigureService { max_loaded, idle_unload_seconds } => self.configure_service(max_loaded, idle_unload_seconds).map(Reply::Service),
+        }
+    }
+
+    async fn counted<T>(&self, work: impl std::future::Future<Output = Result<T, Error>>) -> Result<T, Error> {
+        Metrics::inc(&self.metrics.requests);
+        let result = work.await;
+        if let Err(e) = &result {
+            Metrics::inc(if e.kind == ErrorKind::Cancelled { &self.metrics.cancelled } else { &self.metrics.failed });
+        }
+        result
+    }
+
+    async fn model_info(&self, id: &str) -> Result<ModelDetail, Error> {
+        valid_model_id(id).map_err(|e| Error::new(ErrorKind::InvalidRequest, e))?;
+        let records = self.records().await;
+        let record = records.get(id).ok_or_else(|| Error::new(ErrorKind::UnknownModel, format!("{id} isn't installed")))?;
+        let model = self.model(id, record);
+        let meta = record.meta.as_ref();
+        let mut detail = ModelDetail {
+            template: meta.and_then(|m| m.chat_template.clone()),
+            license: meta.and_then(|m| m.license.clone()),
+            embedding_length: meta.and_then(|m| m.embedding_length),
+            runtime_context: None,
+            slots: None,
+            reasoning_efforts: Vec::new(),
+            model,
+        };
+        if detail.model.loaded()
+            && let Ok(http) = self.shared.worker.ready().await
+            && let Ok(props) = http.get(&format!("/props?model={}", encode_query(id))).await
+        {
+            detail.runtime_context = props["default_generation_settings"]["n_ctx"].as_u64();
+            detail.slots = props["total_slots"].as_u64().map(|n| n as u32);
+            if props["chat_template_caps"]["supports_reasoning_effort"].as_bool() == Some(true) {
+                let checks = REASONING_EFFORTS.iter().map(|level| {
+                    let http = http.clone();
+                    async move {
+                        let body = json!({"model": id, "messages": [{"role": "user", "content": "hello"}],
+                            "chat_template_kwargs": {"enable_thinking": true}, "reasoning_effort": level});
+                        (*level, http.json(Method::POST, "/apply-template", Some(&body), Duration::from_secs(5)).await.is_ok())
+                    }
+                });
+                detail.reasoning_efforts =
+                    futures_util::future::join_all(checks).await.into_iter().filter(|(_, ok)| *ok).map(|(l, _)| l.to_string()).collect();
+            }
+        }
+        Ok(detail)
+    }
+
+    async fn remove(&self, id: &str) -> Result<(), Error> {
+        valid_model_id(id).map_err(|e| Error::new(ErrorKind::InvalidRequest, e))?;
+        let records = self.records().await;
+        let record = records.get(id).ok_or_else(|| Error::new(ErrorKind::UnknownModel, format!("{id} isn't installed")))?;
+        if record.source != Source::Cache {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                format!("{id} is a file in {}; AI Core never deletes files there", record.path.as_ref().and_then(|p| p.parent()).map(|p| p.display().to_string()).unwrap_or_default()),
+            ));
+        }
+        self.downloads.cancel(id);
+        if record.missing {
+            self.shared.registry.forget(id);
+            return Ok(());
+        }
+        if !self.scheduler.unload_if_idle(id).await? {
+            return Err(Error::new(ErrorKind::Busy, format!("{id} is answering a request; try again when it's done")));
+        }
+        let http = self.shared.worker.ready().await?;
+        http.json(Method::DELETE, &format!("/models?model={}", encode_query(id)), None, Duration::from_secs(60)).await?;
+        self.shared.registry.forget(id);
+        tracing::info!(model = %id, "model removed");
+        self.refresh(true).await?;
+        Ok(())
+    }
+
+    fn settings_of(&self, model: &str) -> Result<ModelSettings, Error> {
+        if model != "*" {
+            valid_model_id(model).map_err(|e| Error::new(ErrorKind::InvalidRequest, e))?;
+        }
+        let presets = self.shared.presets.lock().expect("presets");
+        Ok(ModelSettings {
+            model: model.into(),
+            values: presets.ini.values(model),
+            effective: presets.ini.effective(model),
+            pending: presets.waiting.values().any(|w| w.contains(model)) || (model == "*" && presets.held.contains_key("*")),
+        })
+    }
+
+    async fn configure(&self, model: &str, changes: &BTreeMap<String, String>) -> Result<ModelSettings, Error> {
+        let old = {
+            let mut presets = self.shared.presets.lock().expect("presets");
+            if let Ok(text) = std::fs::read_to_string(self.shared.paths.models_ini()) {
+                presets.ini = Ini::parse(&text);
+            }
+            let old = presets.ini.section(model).map(|s| s.to_vec());
+            let mut ini = presets.ini.clone();
+            ini.set(model, changes).map_err(|e| Error::new(ErrorKind::InvalidRequest, e))?;
+            presets::save(&self.shared.paths, &ini).map_err(|e| Error::new(ErrorKind::Internal, format!("couldn't save models.ini: {e}")))?;
+            presets.ini = ini;
+            old
+        };
+        let affected: Vec<String> = if model == "*" {
+            self.scheduler.loaded_models().into_iter().map(|m| m.id).collect()
+        } else {
+            vec![model.to_string()]
+        };
+        let mut busy = BTreeSet::new();
+        for id in affected {
+            if !self.scheduler.unload_if_idle(&id).await? {
+                busy.insert(id);
+            }
+        }
+        if !busy.is_empty() {
+            let mut presets = self.shared.presets.lock().expect("presets");
+            presets.held.entry(model.to_string()).or_insert(old);
+            presets.waiting.entry(model.to_string()).or_default().extend(busy.iter().cloned());
+            drop(presets);
+            for id in &busy {
+                self.scheduler.set_pending(id, true);
+            }
+        }
+        tracing::info!(%model, keys = ?changes.keys().collect::<Vec<_>>(), "model settings changed");
+        if let Err(e) = self.refresh(true).await {
+            tracing::debug!(error = %e, "router not refreshed after a settings change");
+        }
+        self.settings_of(model)
+    }
+
+    /// A busy model with changed settings went idle: unload it so the next
+    /// request loads it with them.
+    async fn apply_held(&self, model: &str) {
+        if !self.scheduler.unload_if_idle(model).await.unwrap_or(false) {
+            return;
+        }
+        self.scheduler.set_pending(model, false);
+        {
+            let mut presets = self.shared.presets.lock().expect("presets");
+            let mut released = Vec::new();
+            for (key, waiting) in presets.waiting.iter_mut() {
+                waiting.remove(model);
+                if waiting.is_empty() {
+                    released.push(key.clone());
+                }
+            }
+            for key in released {
+                presets.waiting.remove(&key);
+                presets.held.remove(&key);
+            }
+        }
+        if let Err(e) = self.refresh(true).await {
+            tracing::debug!(error = %e, "router not refreshed after applying settings");
+        }
+    }
+
+    async fn download(&self, model: &str, events: &mpsc::Sender<Event>, cancel: &CancellationToken) -> Result<(), Error> {
+        let mut rx = self.downloads.start(model)?;
+        let mut last: Option<(String, u64, u64)> = None;
+        loop {
+            let d: Download = rx.borrow_and_update().clone();
+            let now = (d.status.clone(), d.completed, d.total);
+            if last.as_ref() != Some(&now) {
+                let _ = events.send(Event::Progress { status: d.status.clone(), completed: d.completed, total: d.total }).await;
+                last = Some(now);
+            }
+            match d.state {
+                DownloadState::Done => return Ok(()),
+                DownloadState::Cancelled => return Err(Error::new(ErrorKind::Cancelled, "download cancelled")),
+                DownloadState::Failed => {
+                    let message = d.error.unwrap_or_else(|| "download failed".into());
+                    let kind = if message.starts_with("not enough disk space") { ErrorKind::ResourceExhausted } else { ErrorKind::DownloadFailed };
+                    return Err(Error::new(kind, message));
+                }
+                _ => {}
+            }
+            tokio::select! {
+                changed = rx.changed() => if changed.is_err() { return Err(Error::new(ErrorKind::Internal, "the download vanished")) },
+                _ = cancel.cancelled() => return Err(Error::new(ErrorKind::Cancelled, "stopped watching; the download goes on")),
+            }
+        }
+    }
+
+    async fn chat(&self, caller: &Caller, req: ChatRequest, events: &mpsc::Sender<Event>, cancel: &CancellationToken) -> Result<Finished, Error> {
+        req.validate().map_err(|e| Error::new(ErrorKind::InvalidRequest, e))?;
+        let (_, caps) = self.usable(&req.model).await?;
+        let lacks = |cap: Capability, what: &str| -> Result<(), Error> {
+            if caps.contains(&cap) { Ok(()) } else { Err(Error::new(ErrorKind::UnsupportedCapability, format!("{} can't {what}", req.model))) }
+        };
+        lacks(Capability::Chat, "chat")?;
+        if req.has_images() {
+            lacks(Capability::Vision, "see images")?;
+        }
+        if req.has_audio() {
+            lacks(Capability::Audio, "hear audio")?;
+        }
+        if !req.tools.is_empty() {
+            lacks(Capability::Tools, "use tools")?;
+        }
+        let _ = events.send(Event::Accepted).await;
+        let lease = self.scheduler.acquire(&req.model, &caller.name, req.priority, cancel, Some(events)).await?;
+        let _ = events.send(Event::Started).await;
+        let http = self.shared.worker.ready().await?;
+        let started = Instant::now();
+        let body = stream::body(&req, true);
+        let mut response = tokio::select! {
+            r = http.send(Method::POST, "/v1/chat/completions", Some(&body)) => r?,
+            _ = cancel.cancelled() => return Err(Error::new(ErrorKind::Cancelled, "cancelled")),
+        };
+        if !(200..300).contains(&response.status) {
+            return Err(response.json().await.err().unwrap_or_else(|| Error::new(ErrorKind::WorkerFailed, "llama.cpp refused the chat")));
+        }
+        let mut sse = Sse::default();
+        let mut first = None;
+        let mut done = false;
+        while !done {
+            let chunk = tokio::select! {
+                c = response.chunk() => c,
+                _ = cancel.cancelled() => return Err(Error::new(ErrorKind::Cancelled, "cancelled")),
+            };
+            let Some(chunk) = chunk else { break };
+            for item in sse.push(&chunk?) {
+                match item {
+                    stream::Item::Delta(event) => {
+                        first.get_or_insert_with(|| started.elapsed());
+                        tokio::select! {
+                            r = events.send(event) => if r.is_err() { return Err(Error::new(ErrorKind::Cancelled, "the client went away")) },
+                            _ = cancel.cancelled() => return Err(Error::new(ErrorKind::Cancelled, "cancelled")),
+                        }
+                    }
+                    stream::Item::Error(message) => return Err(Error::new(ErrorKind::WorkerFailed, format!("llama.cpp: {message}"))),
+                    stream::Item::Done => done = true,
+                }
+            }
+        }
+        if !done && sse.finish_reason.is_empty() {
+            return Err(Error::new(ErrorKind::WorkerFailed, "llama.cpp stopped before the reply was finished"));
+        }
+        let total = started.elapsed();
+        let (first_token_ms, per_second) = match sse.timings {
+            Some((prompt_ms, per_second)) => (prompt_ms as u64, per_second),
+            None => {
+                let first = first.unwrap_or(total);
+                let generating = total.saturating_sub(first).as_secs_f64();
+                (first.as_millis() as u64, if generating > 0.0 { sse.tokens as f64 / generating } else { 0.0 })
+            }
+        };
+        let mut usage = sse.usage.clone();
+        if usage.completion_tokens == 0 {
+            usage.completion_tokens = sse.tokens;
+        }
+        self.metrics.generated(first_token_ms, per_second);
+        Ok(Finished {
+            finish_reason: if sse.finish_reason.is_empty() { "stop".into() } else { sse.finish_reason.clone() },
+            usage,
+            timings: Timings {
+                queued_ms: lease.queued.as_millis() as u64,
+                load_ms: lease.loaded.map(|d| d.as_millis() as u64).unwrap_or(0),
+                first_token_ms,
+                total_ms: total.as_millis() as u64,
+                tokens_per_second: (per_second * 10.0).round() / 10.0,
+            },
+        })
+    }
+
+    async fn embed(
+        &self,
+        caller: &Caller,
+        model: &str,
+        input: Vec<String>,
+        priority: Priority,
+        events: &mpsc::Sender<Event>,
+        cancel: &CancellationToken,
+    ) -> Result<Embeddings, Error> {
+        if input.is_empty() || input.len() > 4096 {
+            return Err(Error::new(ErrorKind::InvalidRequest, "embed between 1 and 4096 texts at a time"));
+        }
+        let (record, caps) = self.usable(model).await?;
+        if !caps.contains(&Capability::Embedding) {
+            return Err(Error::new(ErrorKind::UnsupportedCapability, format!("{model} isn't an embedding model")));
+        }
+        let _ = events.send(Event::Accepted).await;
+        let _lease = self.scheduler.acquire(model, &caller.name, priority, cancel, Some(events)).await?;
+        let _ = events.send(Event::Started).await;
+        let http = self.shared.worker.ready().await?;
+        let mut vectors = Vec::with_capacity(input.len());
+        for batch in input.chunks(64) {
+            let body = json!({"model": model, "input": batch});
+            let reply = tokio::select! {
+                r = http.json(Method::POST, "/v1/embeddings", Some(&body), Duration::from_secs(300)) => r?,
+                _ = cancel.cancelled() => return Err(Error::new(ErrorKind::Cancelled, "cancelled")),
+            };
+            let mut data = reply["data"].as_array().cloned().unwrap_or_default();
+            data.sort_by_key(|v| v["index"].as_u64().unwrap_or(0));
+            for item in data {
+                vectors.push(item["embedding"].as_array().into_iter().flatten().filter_map(Value::as_f64).map(|v| v as f32).collect::<Vec<f32>>());
+            }
+        }
+        if vectors.len() != input.len() {
+            return Err(Error::new(ErrorKind::WorkerFailed, format!("expected {} embeddings, got {}", input.len(), vectors.len())));
+        }
+        let dimensions = vectors.first().map(Vec::len).unwrap_or(0);
+        if vectors.iter().any(|v| v.len() != dimensions || v.is_empty()) {
+            return Err(Error::new(ErrorKind::WorkerFailed, "llama.cpp returned embeddings of different sizes"));
+        }
+        Metrics::inc(&self.metrics.embeddings);
+        Ok(Embeddings {
+            identity: ModelIdentity {
+                id: model.into(),
+                file: record.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                size: record.size,
+                revision: record.revision.clone(),
+                architecture: record.meta.as_ref().and_then(|m| m.architecture.clone()),
+            },
+            dimensions,
+            vectors,
+        })
+    }
+
+    async fn apply_template(&self, caller: &Caller, req: ChatRequest, cancel: &CancellationToken) -> Result<String, Error> {
+        req.validate().map_err(|e| Error::new(ErrorKind::InvalidRequest, e))?;
+        let (_, caps) = self.usable(&req.model).await?;
+        if !caps.contains(&Capability::Chat) {
+            return Err(Error::new(ErrorKind::UnsupportedCapability, format!("{} has no chat template", req.model)));
+        }
+        let _lease = self.scheduler.acquire(&req.model, &caller.name, req.priority, cancel, None).await?;
+        let http = self.shared.worker.ready().await?;
+        let reply = http.json(Method::POST, "/apply-template", Some(&stream::body(&req, false)), Duration::from_secs(30)).await?;
+        Ok(reply["prompt"].as_str().unwrap_or_default().to_string())
+    }
+
+    fn resource_status(&self) -> ResourceStatus {
+        let mem = resources::detect();
+        let settings = self.settings.lock().expect("settings").clone();
+        ResourceStatus {
+            ram_total: mem.ram,
+            ram_available: resources::available_ram(),
+            vram_total: mem.vram,
+            gpu_backends: resources::gpu_backends(self.shared.worker.program().and_then(|p| p.parent())),
+            budget: resources::budget(mem),
+            max_loaded: settings.max_loaded,
+            idle_unload_seconds: settings.idle_unload_seconds,
+            loaded: self.scheduler.loaded_models(),
+            queued: self.scheduler.queued(),
+            memory_pressure: resources::memory_pressure(),
+        }
+    }
+
+    fn worker_status(&self) -> WorkerStatus {
+        let snap = self.shared.worker.snapshot();
+        WorkerStatus {
+            state: snap.state,
+            release: snap.program.as_deref().and_then(worker::release),
+            program: snap.program.map(|p| p.display().to_string()),
+            pid: snap.pid,
+            restarts: snap.restarts,
+            last_error: snap.last_error,
+            uptime_secs: snap.uptime.as_secs(),
+            metrics: self.metrics.snapshot(self.scheduler.queued() as u64),
+        }
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            api_version: nyx_ai_proto::API_VERSION,
+            server_version: env!("CARGO_PKG_VERSION").into(),
+            operations: OPERATIONS.iter().map(|s| s.to_string()).collect(),
+            gpu_backends: resources::gpu_backends(self.shared.worker.program().and_then(|p| p.parent())),
+            worker_release: self.shared.worker.program().and_then(worker::release),
+        }
+    }
+
+    fn service_settings(&self) -> ServiceSettings {
+        let s = self.settings.lock().expect("settings");
+        ServiceSettings { max_loaded: s.max_loaded, idle_unload_seconds: s.idle_unload_seconds, model_dirs: s.model_dirs.clone() }
+    }
+
+    fn configure_service(&self, max_loaded: Option<u32>, idle: Option<i64>) -> Result<ServiceSettings, Error> {
+        if max_loaded.is_some_and(|n| !(1..=crate::config::MAX_LOADED_LIMIT).contains(&n)) {
+            return Err(Error::new(ErrorKind::InvalidRequest, format!("max_loaded must be 1 to {}", crate::config::MAX_LOADED_LIMIT)));
+        }
+        if idle.is_some_and(|n| n < -1) {
+            return Err(Error::new(ErrorKind::InvalidRequest, "idle_unload_seconds must be -1 (never) or more"));
+        }
+        let mut settings = self.settings.lock().expect("settings");
+        if let Some(n) = max_loaded {
+            settings.max_loaded = n;
+        }
+        if let Some(n) = idle {
+            settings.idle_unload_seconds = n;
+        }
+        settings.save(&self.shared.paths).map_err(|e| Error::new(ErrorKind::Internal, format!("couldn't save settings: {e}")))?;
+        self.scheduler.set_limits(settings.max_loaded, settings.idle_unload_seconds);
+        tracing::info!(max_loaded = settings.max_loaded, idle = settings.idle_unload_seconds, "service settings changed");
+        drop(settings);
+        Ok(self.service_settings())
+    }
+}

@@ -1,0 +1,15 @@
+[Unit]
+Description=Nyx AI Core (shared local models)
+Requires=nyx-aid.socket
+After=nyx-aid.socket
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/nyx-aid
+Environment=RUST_LOG=info
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=20
+
+[Install]
+Also=nyx-aid.socket

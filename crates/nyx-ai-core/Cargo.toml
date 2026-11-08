@@ -1,0 +1,36 @@
+[package]
+name = "nyx-ai-core"
+description = "Nyx AI Core: the shared local model runtime's daemon library"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "nyx-ai-stub-worker"
+path = "src/bin/stub_worker.rs"
+doc = false
+
+[dependencies]
+nyx-ai-proto.workspace = true
+nyx-peer = { git = "https://github.com/design-nexus/nyx-core.git", rev = "a801c59bf6868d45f4120a7b4974f1c47e5fe7a1" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+libc.workspace = true
+bytes = "1"
+futures-util = "0.3"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+sha2 = "0.10"
+tokio-util = "0.7"
+toml = "1"
+
+[dev-dependencies]
+nyx-ai-client.workspace = true
+tempfile = "3"

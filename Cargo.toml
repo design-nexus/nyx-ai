@@ -1,0 +1,24 @@
+[workspace]
+resolver = "3"
+members = ["crates/nyx-ai-proto", "crates/nyx-ai-client", "crates/nyx-ai-core", "apps/nyx-aid", "apps/nyx-ai"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+authors = ["Ken Smith"]
+repository = "https://github.com/design-nexus/nyx-ai"
+
+[workspace.dependencies]
+nyx-ai-proto = { path = "crates/nyx-ai-proto" }
+nyx-ai-client = { path = "crates/nyx-ai-client" }
+nyx-ai-core = { path = "crates/nyx-ai-core" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "fs", "signal"] }
+tracing = "0.1"
+libc = "0.2"
+
+[profile.release]
+lto = "thin"
