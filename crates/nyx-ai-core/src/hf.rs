@@ -26,6 +26,20 @@ pub fn sidecar_kind(path: &str) -> Option<&'static str> {
 
 pub const SIDECARS: &[&str] = &["mmproj", "mtp", "dflash", "eagle3", "dspark"];
 
+/// The projector next to a cached model, when its snapshot holds exactly one.
+pub fn snapshot_projector(model: &Path) -> Option<PathBuf> {
+    if !model.components().any(|c| c.as_os_str() == "snapshots") {
+        return None;
+    }
+    let mut found = std::fs::read_dir(model.parent()?)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.to_str().is_some_and(|s| sidecar_kind(s) == Some("mmproj")));
+    let first = found.next()?;
+    found.next().is_none().then_some(first)
+}
+
 /// Projectors, MTP heads and speculative drafters are companion files, not
 /// models to chat with.
 pub fn auxiliary_gguf(path: &str) -> bool {

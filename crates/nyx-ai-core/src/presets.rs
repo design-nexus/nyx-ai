@@ -22,10 +22,31 @@ pub const KEYS: &[&str] = &[
     "repeat-penalty",
     "parallel",
     "embeddings",
+    "pooling",
+    "batch-size",
+    "ubatch-size",
+    "image-min-tokens",
+    "image-max-tokens",
 ];
 
 /// Settings that change what a load allocates (the rest are sampling defaults).
-pub const RUNTIME_KEYS: &[&str] = &["ctx-size", "n-gpu-layers", "flash-attn", "cache-type-k", "cache-type-v", "parallel", "embeddings"];
+pub const RUNTIME_KEYS: &[&str] = &[
+    "ctx-size",
+    "n-gpu-layers",
+    "flash-attn",
+    "cache-type-k",
+    "cache-type-v",
+    "parallel",
+    "embeddings",
+    "pooling",
+    "batch-size",
+    "ubatch-size",
+    "image-min-tokens",
+    "image-max-tokens",
+];
+
+/// Settings that change what an embedding model's vectors are.
+pub const VECTOR_KEYS: &[&str] = &["pooling", "image-min-tokens", "image-max-tokens"];
 
 pub fn canonical(key: &str) -> &str {
     match key.trim() {
@@ -37,6 +58,9 @@ pub fn canonical(key: &str) -> &str {
         "temp" | "temperature" => "temp",
         "np" | "parallel" | "LLAMA_ARG_N_PARALLEL" => "parallel",
         "embedding" | "embeddings" | "LLAMA_ARG_EMBEDDINGS" => "embeddings",
+        "b" | "batch-size" | "LLAMA_ARG_BATCH" => "batch-size",
+        "ub" | "ubatch-size" | "LLAMA_ARG_UBATCH" => "ubatch-size",
+        "pooling" | "LLAMA_ARG_POOLING" => "pooling",
         other => other,
     }
 }
@@ -73,6 +97,10 @@ pub fn validate(key: &str, value: &str) -> Result<(String, String), String> {
         "parallel" => integer(1, 16)?,
         "embeddings" if matches!(value, "true" | "false") => value.to_string(),
         "embeddings" => return Err("embeddings must be true or false".into()),
+        "pooling" if matches!(value, "none" | "mean" | "cls" | "last" | "rank") => value.to_string(),
+        "pooling" => return Err("pooling must be none, mean, cls, last or rank".into()),
+        "batch-size" | "ubatch-size" => integer(1, 65536)?,
+        "image-min-tokens" | "image-max-tokens" => integer(1, 16384)?,
         other => return Err(format!("{other} isn't a setting AI Core manages")),
     };
     Ok((key.to_string(), value))

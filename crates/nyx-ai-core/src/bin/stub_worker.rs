@@ -6,7 +6,9 @@
 //!
 //! A chat whose last message contains `count:N` streams N tokens; `crash` makes
 //! the process exit mid-reply. `STUB_DELAY_MS` sets the time between tokens and
-//! `STUB_SLOTS` the slots per model.
+//! `STUB_SLOTS` the slots per model. A cache model with an `mmproj` file in its
+//! snapshot takes images and audio; `/embeddings` embeds them when the prompt is
+//! the media marker from `/props`.
 
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -27,7 +29,10 @@ struct Model {
     source: &'static str,
     status: &'static str,
     failed: bool,
+    media: bool,
 }
+
+const MARKER: &str = "<__media_stub__>";
 
 struct Stub {
     key: String,
@@ -60,6 +65,7 @@ impl Stub {
             let Some(rest) = name.strip_prefix("models--") else { continue };
             let repo_id = rest.replacen("--", "/", 1);
             for rev in std::fs::read_dir(repo.path().join("snapshots")).into_iter().flatten().flatten() {
+                let media = std::fs::read_dir(rev.path()).into_iter().flatten().flatten().any(|f| f.file_name().to_string_lossy().contains("mmproj"));
                 for file in std::fs::read_dir(rev.path()).into_iter().flatten().flatten() {
                     let file_name = file.file_name().to_string_lossy().into_owned();
                     let Some(stem) = file_name.strip_suffix(".gguf") else { continue };
@@ -68,7 +74,7 @@ impl Stub {
                     }
                     let quant = stem.rsplit('-').next().unwrap_or(stem).to_ascii_uppercase();
                     let path = file.path().display().to_string();
-                    models.insert(format!("{repo_id}:{quant}"), Model { path, source: "cache", status: "unloaded", failed: false });
+                    models.insert(format!("{repo_id}:{quant}"), Model { path, source: "cache", status: "unloaded", failed: false, media });
                 }
             }
         }
@@ -80,7 +86,7 @@ impl Stub {
                 if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
                     section = name.into();
                 } else if let Some(path) = line.strip_prefix("model =") {
-                    models.insert(section.clone(), Model { path: path.trim().into(), source: "preset", status: "unloaded", failed: false });
+                    models.insert(section.clone(), Model { path: path.trim().into(), source: "preset", status: "unloaded", failed: false, media: false });
                 }
             }
         }
@@ -102,8 +108,9 @@ impl Stub {
                     status["failed"] = json!(true);
                     status["exit_code"] = json!(1);
                 }
+                let inputs = if m.media { json!(["text", "image", "audio"]) } else { json!(["text"]) };
                 json!({"id": id, "source": m.source, "status": status,
-                    "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]}})
+                    "architecture": {"input_modalities": inputs, "output_modalities": ["text"]}})
             })
             .collect();
         json!({"data": data})
@@ -191,7 +198,7 @@ async fn handle(stub: Arc<Stub>, req: Request<Incoming>) -> Result<Response<Body
         ("GET", "/props") => {
             let slots: u64 = std::env::var("STUB_SLOTS").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
             reply(StatusCode::OK, json!({"total_slots": slots, "default_generation_settings": {"n_ctx": 4096},
-                "chat_template_caps": {"supports_reasoning_effort": false}}))
+                "chat_template_caps": {"supports_reasoning_effort": false}, "media_marker": MARKER}))
         }
         ("POST", "/v1/chat/completions") => {
             if stub.status(&model) != Some("loaded") {
@@ -240,6 +247,22 @@ async fn handle(stub: Arc<Stub>, req: Request<Incoming>) -> Result<Response<Body
                 .collect();
             data.reverse();
             reply(StatusCode::OK, json!({"data": data}))
+        }
+        ("POST", "/embeddings") => {
+            if stub.status(&model) != Some("loaded") {
+                return Ok(error(StatusCode::BAD_REQUEST, "model is not loaded"));
+            }
+            let mut data = Vec::new();
+            for (i, item) in body["content"].as_array().into_iter().flatten().enumerate() {
+                let first = match item {
+                    Value::String(text) => text.len() as f32,
+                    _ if item["prompt_string"] == MARKER && item["multimodal_data"].as_array().is_some_and(|m| m.len() == 1) => 1000.0,
+                    _ => return Ok(error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to tokenize prompt")),
+                };
+                data.push(json!({"index": i, "embedding": [[first, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5]]}));
+            }
+            data.reverse();
+            reply(StatusCode::OK, Value::Array(data))
         }
         ("POST", "/apply-template") => reply(StatusCode::OK, json!({"prompt": "<stub template>"})),
         _ => error(StatusCode::NOT_FOUND, "not found"),

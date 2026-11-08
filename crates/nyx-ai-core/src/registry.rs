@@ -65,6 +65,9 @@ pub struct Record {
     pub audio: bool,
     #[serde(default)]
     pub draft: bool,
+    /// The projector the worker pairs with it (images and audio).
+    #[serde(default)]
+    pub projector: Option<PathBuf>,
     #[serde(default)]
     pub error: Option<String>,
     /// Not in the latest listing.
@@ -242,6 +245,7 @@ impl Registry {
                 vision: item.inputs.iter().any(|i| i == "image"),
                 audio: item.inputs.iter().any(|i| i == "audio"),
                 draft: source == Source::Cache && hf::cached_auxiliary_model(&self.paths.cache, &item.id),
+                projector: folder.and_then(|f| f.mmproj.clone()).or_else(|| path.as_deref().and_then(hf::snapshot_projector)),
                 error: item.failed.clone(),
                 missing: false,
             };

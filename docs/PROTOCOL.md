@@ -48,7 +48,7 @@ daemon. Lines are at most 64 MiB. A connection may have 32 requests open.
 | `cancel_download` | `model` | | `ok` |
 | `downloads` | | | `downloads` |
 | `chat` | see below | `accepted`, `queued`, `model_loading`, `started`, `delta` | `finished` |
-| `embed` | `model`, `input` (strings), `priority` | `accepted`, `queued`, `model_loading`, `started` | `embeddings` |
+| `embed` | `model`, `input` (strings, `{"image": …}`, `{"audio": …}`), `priority` | `accepted`, `queued`, `model_loading`, `started` | `embeddings` |
 | `apply_template` | as `chat` | | `template` |
 | `cancel` | `request` (an id on this connection) | | `ok` |
 | `resource_status` | | | `resources` |
@@ -109,9 +109,15 @@ drops its partial files.
 
 ### `embed`
 
-`embeddings` has `vectors`, `dimensions` and `identity`
-(`id`, `file`, `size`, `revision`, `architecture`). Store the identity with an
-index and compare it before mixing vectors. The model needs `embedding`.
+`input` items are strings, or `{"image": "<base64>"}` and `{"audio": "<base64>"}`
+(the file's bytes, or a `data:` URL; up to 36 MB), which need a model with
+`vision` or `audio` (an embedding model with its projector, like EmbeddingGemma 2).
+Vectors are unit-length.
+
+`embeddings` has `vectors`, `dimensions` and `identity` (`id`, `file`, `size`,
+`revision`, `architecture`, `projector`, and `settings`: the load settings that
+change vectors). Store the identity with an index and compare it before mixing
+vectors. The model needs `embedding`. See `GLIMPSE.md`.
 
 ### Models
 
@@ -141,6 +147,9 @@ Capabilities come from GGUF metadata and the worker, never from the file name.
 | `repeat-penalty` | 0 to 5 |
 | `parallel` | 1 to 16 |
 | `embeddings` | `true`, `false` |
+| `pooling` | `none`, `mean`, `cls`, `last`, `rank` |
+| `batch-size`, `ubatch-size` | 1 to 65536 |
+| `image-min-tokens`, `image-max-tokens` | 1 to 16384 |
 
 Other keys already in `~/.config/nyx-ai/models.ini` are kept as they are.
 Changes to a loaded model apply when it's next idle (it unloads and the next
@@ -214,6 +223,9 @@ shape (`{"error": {"code", "message", "type"}}`).
 - Version 1, additions: actions (`list_actions`, `invoke_action`,
   `serve_actions`, `action_result`, the `invoke` event, and the errors
   `unknown_action`, `confirmation_required` and `action_failed`).
+- Version 1, additions: image and audio `embed` inputs; `ModelIdentity.projector`
+  and `settings`; the settings keys `pooling`, `batch-size`, `ubatch-size`,
+  `image-min-tokens` and `image-max-tokens`.
 
 ## Default models
 

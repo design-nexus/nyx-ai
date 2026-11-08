@@ -56,7 +56,8 @@ let models = client.list_models().await?;
 let reply = client.chat(request).await?.collect_chat().await?;
 ```
 
-Depend on `nyx-ai-client` by Git revision.
+Depend on `nyx-ai-client` by Git revision. `docs/GLIMPSE.md` covers embedding
+text, images and audio for semantic search.
 
 ## Actions
 

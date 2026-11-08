@@ -69,6 +69,7 @@ Record the results here with the upstream tag tested.
 | Gemma 4 E2B Q4_K_M + BF16 mmproj (folder) | chat, tool call, image | all correct; about 190-210 tokens/s |
 | Ternary Bonsai 2 9B `PQ2_0` (cache) | chat at temperature 0 | correct ("Paris"); about 100 tokens/s |
 | EmbeddingGemma 2 Q8_0 (Glimpse's folder) | embed three texts | 768 dimensions; cat/kitten 0.94, cat/tax 0.53 |
+| EmbeddingGemma 2 Q8_0 + Q8_0 mmproj (Glimpse's folder) | text, two images, audio | match Glimpse's runtime (cosine 0.9998 to 1.0000; see `GLIMPSE.md`) |
 
 `prism-b10826-c9c34bc`, the earlier pin:
 

@@ -127,7 +127,7 @@ pub enum Op {
     Chat(ChatRequest),
     Embed {
         model: String,
-        input: Vec<String>,
+        input: Vec<EmbedInput>,
         #[serde(default)]
         priority: Priority,
     },
@@ -824,6 +824,28 @@ pub struct Finished {
     pub timings: Timings,
 }
 
+/// One thing to embed: text, or an image or audio clip (the file's bytes in
+/// base64, or a `data:` URL). Media needs a model with `vision` or `audio`.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[serde(untagged)]
+pub enum EmbedInput {
+    Text(String),
+    Image { image: String },
+    Audio { audio: String },
+}
+
+impl From<String> for EmbedInput {
+    fn from(text: String) -> EmbedInput {
+        EmbedInput::Text(text)
+    }
+}
+
+impl From<&str> for EmbedInput {
+    fn from(text: &str) -> EmbedInput {
+        EmbedInput::Text(text.into())
+    }
+}
+
 /// What produced a set of vectors, so an index can tell when they'd mix.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct ModelIdentity {
@@ -834,6 +856,13 @@ pub struct ModelIdentity {
     pub revision: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub architecture: Option<String>,
+    /// The projector file that embeds images and audio, if the model has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub projector: Option<String>,
+    /// Load settings that change the vectors (`pooling`, `image-min-tokens`,
+    /// `image-max-tokens`), when set.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub settings: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -1037,7 +1066,7 @@ mod tests {
                 sampling: Sampling { temperature: Some(0.2), ..Default::default() },
                 ..Default::default()
             }),
-            Op::Embed { model: "e".into(), input: vec!["a".into()], priority: Priority::Background },
+            Op::Embed { model: "e".into(), input: vec!["a".into(), EmbedInput::Image { image: "aGk=".into() }], priority: Priority::Background },
             Op::ConfigureService {
                 max_loaded: Some(2),
                 idle_unload_seconds: None,

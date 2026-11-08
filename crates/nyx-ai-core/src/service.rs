@@ -16,7 +16,7 @@ use crate::worker::{self, Worker, encode_query};
 use futures_util::future::BoxFuture;
 use hyper::Method;
 use nyx_ai_proto::{
-    Capabilities, Capability, ChatRequest, Download, DownloadState, Embeddings, Error, ErrorKind, Event, Finished, Model, ModelDetail,
+    Capabilities, Capability, ChatRequest, Download, EmbedInput, DownloadState, Embeddings, Error, ErrorKind, Event, Finished, Model, ModelDetail,
     ModelIdentity, ModelSettings, ModelState, OPERATIONS, Op, Priority, REASONING_EFFORTS, Reply, ResourceStatus, ServiceSettings, Source,
     Timings, WorkerStatus, valid_model_id,
 };
@@ -789,33 +789,77 @@ impl Service {
         &self,
         caller: &Caller,
         model: &str,
-        input: Vec<String>,
+        input: Vec<EmbedInput>,
         priority: Priority,
         events: &mpsc::Sender<Event>,
         cancel: &CancellationToken,
     ) -> Result<Embeddings, Error> {
         if input.is_empty() || input.len() > 4096 {
-            return Err(Error::new(ErrorKind::InvalidRequest, "embed between 1 and 4096 texts at a time"));
+            return Err(Error::new(ErrorKind::InvalidRequest, "embed between 1 and 4096 inputs at a time"));
         }
         let (record, caps) = self.usable(model).await?;
         if !caps.contains(&Capability::Embedding) {
             return Err(Error::new(ErrorKind::UnsupportedCapability, format!("{model} isn't an embedding model")));
         }
+        for item in &input {
+            let (data, needs, what) = match item {
+                EmbedInput::Text(_) => continue,
+                EmbedInput::Image { image } => (image, Capability::Vision, "images"),
+                EmbedInput::Audio { audio } => (audio, Capability::Audio, "audio"),
+            };
+            if !caps.contains(&needs) {
+                return Err(Error::new(ErrorKind::UnsupportedCapability, format!("{model} can't embed {what} (it has no projector for them)")));
+            }
+            media_base64(data)?;
+        }
+        let media = input.iter().any(|i| !matches!(i, EmbedInput::Text(_)));
         let _ = events.send(Event::Accepted).await;
         let _lease = self.scheduler.acquire(model, &caller.name, priority, cancel, Some(events)).await?;
         let _ = events.send(Event::Started).await;
         let http = self.shared.worker.ready().await?;
+        let marker = if media {
+            let props = http.get(&format!("/props?model={}", encode_query(model))).await?;
+            Some(props["media_marker"].as_str().unwrap_or("<__media__>").to_string())
+        } else {
+            None
+        };
         let mut vectors = Vec::with_capacity(input.len());
-        for batch in input.chunks(64) {
-            let body = json!({"model": model, "input": batch});
+        for batch in input.chunks(if media { 16 } else { 64 }) {
+            let (path, body) = match &marker {
+                None => {
+                    let texts: Vec<&str> = batch.iter().filter_map(|i| if let EmbedInput::Text(t) = i { Some(t.as_str()) } else { None }).collect();
+                    ("/v1/embeddings", json!({"model": model, "input": texts}))
+                }
+                Some(marker) => {
+                    let content: Vec<Value> = batch
+                        .iter()
+                        .map(|i| match i {
+                            EmbedInput::Text(t) => json!(t),
+                            EmbedInput::Image { image: data } | EmbedInput::Audio { audio: data } => {
+                                json!({"prompt_string": marker, "multimodal_data": [media_base64(data).unwrap_or_default()]})
+                            }
+                        })
+                        .collect();
+                    ("/embeddings", json!({"model": model, "content": content, "embd_normalize": 2}))
+                }
+            };
             let reply = tokio::select! {
-                r = http.json(Method::POST, "/v1/embeddings", Some(&body), Duration::from_secs(300)) => r?,
+                r = http.json(Method::POST, path, Some(&body), Duration::from_secs(300)) => r?,
                 _ = cancel.cancelled() => return Err(Error::new(ErrorKind::Cancelled, "cancelled")),
             };
-            let mut data = reply["data"].as_array().cloned().unwrap_or_default();
+            let mut data = reply.get("data").unwrap_or(&reply).as_array().cloned().unwrap_or_default();
             data.sort_by_key(|v| v["index"].as_u64().unwrap_or(0));
             for item in data {
-                vectors.push(item["embedding"].as_array().into_iter().flatten().filter_map(Value::as_f64).map(|v| v as f32).collect::<Vec<f32>>());
+                let embedding = match &item["embedding"] {
+                    Value::Array(rows) if rows.first().is_some_and(Value::is_array) => {
+                        if rows.len() != 1 {
+                            return Err(Error::new(ErrorKind::WorkerFailed, format!("{model} gives a vector per token; set its pooling")));
+                        }
+                        rows[0].clone()
+                    }
+                    other => other.clone(),
+                };
+                vectors.push(embedding.as_array().into_iter().flatten().filter_map(Value::as_f64).map(|v| v as f32).collect::<Vec<f32>>());
             }
         }
         if vectors.len() != input.len() {
@@ -826,13 +870,20 @@ impl Service {
             return Err(Error::new(ErrorKind::WorkerFailed, "llama.cpp returned embeddings of different sizes"));
         }
         Metrics::inc(&self.metrics.embeddings);
+        let file_name = |p: &std::path::Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+        let settings = {
+            let presets = self.shared.presets.lock().expect("presets");
+            presets.ini.effective(model).into_iter().filter(|(k, _)| presets::VECTOR_KEYS.contains(&k.as_str())).collect()
+        };
         Ok(Embeddings {
             identity: ModelIdentity {
                 id: model.into(),
-                file: record.path.as_ref().and_then(|p| p.file_name()).map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(),
+                file: record.path.as_deref().and_then(file_name).unwrap_or_default(),
                 size: record.size,
                 revision: record.revision.clone(),
                 architecture: record.meta.as_ref().and_then(|m| m.architecture.clone()),
+                projector: record.projector.as_deref().and_then(file_name),
+                settings,
             },
             dimensions,
             vectors,
@@ -1127,4 +1178,19 @@ impl Service {
         drop(settings);
         Ok(self.service_settings())
     }
+}
+
+/// An image or audio clip's base64, from plain base64 or a `data:` URL.
+fn media_base64(data: &str) -> Result<&str, Error> {
+    let b64 = match data.strip_prefix("data:") {
+        Some(url) => url.split_once(";base64,").map(|(_, b)| b).ok_or_else(|| Error::new(ErrorKind::InvalidRequest, "media data URLs must be base64"))?,
+        None => data,
+    };
+    if b64.is_empty() || b64.len() > 48 << 20 {
+        return Err(Error::new(ErrorKind::InvalidRequest, "media must be between 1 byte and 36 MB"));
+    }
+    if !b64.bytes().all(|c| c.is_ascii_alphanumeric() || b"+/=".contains(&c)) {
+        return Err(Error::new(ErrorKind::InvalidRequest, "media must be base64"));
+    }
+    Ok(b64)
 }

@@ -2,7 +2,7 @@
 //! list, chat, embeddings, eviction, cancel, crash recovery and settings.
 
 use nyx_ai_client::proto::{
-    ActionSpec, ChatRequest, Confirmation, SideEffects, ClientLine, ErrorKind, Event, Hello, Message, ModelState, Op, Priority, Role, ServerLine, encode,
+    ActionSpec, ChatRequest, Confirmation, EmbedInput, SideEffects, ClientLine, ErrorKind, Event, Hello, Message, ModelState, Op, Priority, Role, ServerLine, encode,
 };
 use nyx_ai_client::{Client, Item};
 use nyx_ai_core::paths::Paths;
@@ -91,6 +91,7 @@ impl Harness {
         .unwrap();
         cached(&paths, "org/chat", "chat-Q4_K_M.gguf", &chat_file());
         cached(&paths, "org/embed", "embed-Q8_0.gguf", &embed_file());
+        cached(&paths, "org/embed", "mmproj-embed-Q8_0.gguf", &embed_file());
         cached(&paths, "org/other", "other-Q4_K_M.gguf", &chat_file());
         cached(&paths, "org/broken", "broken-Q4_K_M.gguf", &chat_file());
         let options = Options {
@@ -166,6 +167,15 @@ async fn embeddings_evict_the_chat_model_and_check_capabilities() {
     assert_eq!((e.vectors[0][0], e.vectors[1][0]), (1.0, 4.0));
     assert_eq!(e.identity.file, "embed-Q8_0.gguf");
     assert_eq!(e.identity.revision.as_deref(), Some("0123456789abcdef0123456789abcdef01234567"));
+    assert_eq!(e.identity.projector.as_deref(), Some("mmproj-embed-Q8_0.gguf"));
+
+    let media = vec![EmbedInput::from("abc"), EmbedInput::Image { image: "aGVsbG8=".into() }, EmbedInput::Audio { audio: "data:audio/wav;base64,aGk=".into() }];
+    let e = h.client.embed_inputs("org/embed:Q8_0", media, Priority::Normal).await.unwrap();
+    assert_eq!(e.vectors.iter().map(|v| v[0]).collect::<Vec<_>>(), [3.0, 1000.0, 1000.0]);
+    let bad = h.client.embed_inputs("org/embed:Q8_0", vec![EmbedInput::Image { image: "not base64!".into() }], Priority::Normal).await;
+    assert_eq!(bad.unwrap_err().kind, ErrorKind::InvalidRequest);
+    let pictures = h.client.embed_inputs("org/chat:Q4_K_M", vec![EmbedInput::Image { image: "aGk=".into() }], Priority::Normal).await;
+    assert_eq!(pictures.unwrap_err().kind, ErrorKind::UnsupportedCapability);
     let status = h.client.resource_status().await.unwrap();
     assert_eq!(status.loaded.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["org/embed:Q8_0"]);
     assert_eq!(h.client.worker_status().await.unwrap().metrics.evictions, 1);

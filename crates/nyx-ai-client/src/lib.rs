@@ -7,7 +7,7 @@
 pub use nyx_ai_proto as proto;
 
 use proto::{
-    API_VERSION, ActionInfo, ActionSpec, Capabilities, ChatRequest, ClientLine, Download, Embeddings, Error, ErrorKind, Event, Hello, MAX_LINE, Model,
+    API_VERSION, ActionInfo, ActionSpec, Capabilities, ChatRequest, ClientLine, Download, EmbedInput, Embeddings, Error, ErrorKind, Event, Hello, MAX_LINE, Model,
     ModelDetail, ModelSettings, Op, Priority, Reply, Request, ResourceStatus, ServerLine, ServiceSettings, ToolCallDelta,
     WorkerStatus, encode,
 };
@@ -199,6 +199,12 @@ impl Client {
     }
 
     pub async fn embed(&self, model: &str, input: Vec<String>, priority: Priority) -> Result<Embeddings> {
+        self.embed_inputs(model, input.into_iter().map(EmbedInput::Text).collect(), priority).await
+    }
+
+    /// Embed text, images and audio together (one vector space with a model like
+    /// EmbeddingGemma 2 and its projector).
+    pub async fn embed_inputs(&self, model: &str, input: Vec<EmbedInput>, priority: Priority) -> Result<Embeddings> {
         match self.call(Op::Embed { model: model.into(), input, priority }).await? {
             Reply::Embeddings(e) => Ok(e),
             other => Err(unexpected(&other)),

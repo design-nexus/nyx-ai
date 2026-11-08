@@ -1,7 +1,7 @@
 //! `nyx-ai`: Nyx AI Core from the command line. `--json` prints what the daemon
 //! returned, for scripts and Nyx Settings.
 
-use nyx_ai_client::proto::{ChatRequest, Event, Message, Priority, Reply, Role};
+use nyx_ai_client::proto::{ChatRequest, EmbedInput, Event, Message, Priority, Reply, Role};
 use nyx_ai_client::{Client, Item};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -27,7 +27,7 @@ const USAGE: &str = "Usage: nyx-ai COMMAND [--json]
   default ROLE [MODEL]         show or set the default model for a role (chat, assistant,
                                embedding, coding); \"\" clears it
   chat MODEL PROMPT…           ask a model (--think to show its reasoning)
-  embed MODEL TEXT…            embed texts
+  embed MODEL INPUT…           embed texts, image:FILE and audio:FILE (with a projector)
   capabilities                 what this Nyx AI Core supports
   actions                      actions apps offer (running apps and registered providers)
   act ACTION [JSON] [--yes]    run an action with JSON arguments (--yes: you agree to it,
@@ -346,7 +346,23 @@ async fn run(client: &Client, args: &[String], flags: Flags) -> nyx_ai_client::R
         "embed" => {
             let model = need(args, 1, "MODEL")?;
             need(args, 2, "TEXT")?;
-            let e = client.embed(model, args[2..].to_vec(), Priority::Normal).await?;
+            let mut inputs = Vec::new();
+            for arg in &args[2..] {
+                let media = |path: &str| {
+                    use base64::Engine;
+                    std::fs::read(path)
+                        .map(|bytes| base64::engine::general_purpose::STANDARD.encode(bytes))
+                        .map_err(|e| nyx_ai_client::proto::Error::new(nyx_ai_client::proto::ErrorKind::InvalidRequest, format!("{path}: {e}")))
+                };
+                inputs.push(if let Some(path) = arg.strip_prefix("image:") {
+                    EmbedInput::Image { image: media(path)? }
+                } else if let Some(path) = arg.strip_prefix("audio:") {
+                    EmbedInput::Audio { audio: media(path)? }
+                } else {
+                    EmbedInput::Text(arg.clone())
+                });
+            }
+            let e = client.embed_inputs(model, inputs, Priority::Normal).await?;
             if json {
                 print_json(&e);
             } else {
