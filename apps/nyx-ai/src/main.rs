@@ -15,6 +15,7 @@ const USAGE: &str = "Usage: nyx-ai COMMAND [--json]
   info MODEL                   one model in detail
   pull ORG/REPO:QUANT          download from Hugging Face (or update to its newest revision)
   updates                      check Hugging Face for newer revisions now
+  downloads                    downloads queued, running and finished
   cancel-pull MODEL            stop a download
   rm MODEL                     delete a model from the shared cache
   load MODEL [--keep]          load now (--keep: until unload)
@@ -178,6 +179,19 @@ async fn run(client: &Client, args: &[String], json: bool, keep: bool, think: bo
                 }
                 let mode = client.service_settings().await?.model_updates.unwrap_or_default();
                 println!("{}", if mode == "auto" { "They download when the computer is idle and on mains power." } else { "Run nyx-ai pull MODEL to update." });
+            }
+        }
+        "downloads" => {
+            let list = client.downloads().await?;
+            if json {
+                print_json(&list);
+            } else if list.is_empty() {
+                println!("No downloads.");
+            } else {
+                for d in list {
+                    let state = format!("{:?}", d.state).to_lowercase();
+                    println!("{state:<10} {}  {} of {}{}", d.model, gb(d.completed), gb(d.total), d.error.map(|e| format!("  ({e})")).unwrap_or_default());
+                }
             }
         }
         "cancel-pull" => client.cancel_download(need(args, 1, "MODEL")?).await?,
