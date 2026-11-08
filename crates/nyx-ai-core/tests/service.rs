@@ -84,7 +84,7 @@ impl Harness {
         cached(&paths, "org/other", "other-Q4_K_M.gguf", &chat_file());
         cached(&paths, "org/broken", "broken-Q4_K_M.gguf", &chat_file());
         let options = Options { allow_untrusted: false, worker: Some(env!("CARGO_BIN_EXE_nyx-ai-stub-worker").into()) };
-        let listener = nyx_ai_core::server::listen(&paths.socket).unwrap();
+        let listener = nyx_ai_core::server::listen(&paths.socket).unwrap().unix;
         let service = Service::new(paths.clone(), options);
         let stop = CancellationToken::new();
         service.run_background(stop.clone());
@@ -251,6 +251,52 @@ async fn settings_pins_and_removal() {
     let op = Op::RemoveModel { model: "org/chat:Q4_K_M".into() };
     assert_eq!(h.service.authorize(&untrusted, &op).unwrap_err().kind, ErrorKind::PermissionDenied);
     assert!(h.service.authorize(&untrusted, &Op::ListModels {}).is_ok());
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn openai_endpoint_for_coding_tools() {
+    let h = Harness::start().await;
+    let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    tcp.set_nonblocking(true).unwrap();
+    let base = format!("http://{}", tcp.local_addr().unwrap());
+    tokio::spawn(nyx_ai_core::openai::serve(h.service.clone(), tcp, h.stop.clone()));
+    let http = reqwest::Client::new();
+
+    let models: serde_json::Value = http.get(format!("{base}/v1/models")).send().await.unwrap().json().await.unwrap();
+    let ids: Vec<&str> = models["data"].as_array().unwrap().iter().filter_map(|m| m["id"].as_str()).collect();
+    assert!(ids.contains(&"org/chat:Q4_K_M") && ids.contains(&"org/embed:Q8_0"), "{ids:?}");
+
+    let chat = serde_json::json!({"model": "org/chat:Q4_K_M", "stream": true, "messages": [{"role": "user", "content": "hi"}]});
+    let reply = http.post(format!("{base}/v1/chat/completions")).json(&chat).send().await.unwrap();
+    assert_eq!(reply.status(), 200);
+    assert_eq!(reply.headers()["content-type"], "text/event-stream");
+    let text = reply.text().await.unwrap();
+    assert!(text.contains("tok4") && text.contains("[DONE]"), "{text}");
+
+    let status = |body: serde_json::Value, path: &'static str| {
+        let (http, base) = (http.clone(), base.clone());
+        async move { http.post(format!("{base}{path}")).json(&body).send().await.unwrap().status().as_u16() }
+    };
+    assert_eq!(status(serde_json::json!({"messages": []}), "/v1/chat/completions").await, 400);
+    assert_eq!(status(serde_json::json!({"model": "org/none:Q4_0", "messages": []}), "/v1/chat/completions").await, 404);
+    assert_eq!(status(serde_json::json!({"model": "org/chat:Q4_K_M", "input": ["x"]}), "/v1/embeddings").await, 400);
+    assert_eq!(status(serde_json::json!({"model": "org/embed:Q8_0", "input": ["x"]}), "/v1/embeddings").await, 200);
+    assert_eq!(http.get(format!("{base}/v1/secret")).send().await.unwrap().status(), 400);
+
+    let slow = serde_json::json!({"model": "org/chat:Q4_K_M", "stream": true, "messages": [{"role": "user", "content": "count:500"}]});
+    let mut reply = http.post(format!("{base}/v1/chat/completions")).json(&slow).send().await.unwrap();
+    assert!(reply.chunk().await.unwrap().is_some());
+    drop(reply);
+    let mut idle = false;
+    for _ in 0..50 {
+        if h.client.resource_status().await.unwrap().loaded.iter().all(|m| m.active == 0) {
+            idle = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(idle, "a dropped request kept its slot");
     h.stop().await;
 }
 

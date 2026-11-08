@@ -129,6 +129,14 @@ Other keys already in `~/.config/nyx-ai/models.ini` are kept as they are.
 Changes to a loaded model apply when it's next idle (it unloads and the next
 request loads it with the new settings); `pending_settings` shows that.
 
+## OpenAI-compatible endpoint
+
+Separate from this protocol: `http://127.0.0.1:8080/v1` (see `ARCHITECTURE.md`).
+`GET /v1/models` lists usable models; `POST /v1/chat/completions`,
+`/v1/completions`, `/v1/embeddings` and other `/v1/*` routes the worker serves
+take the usual OpenAI bodies with a `model` from that list. Errors use OpenAI's
+shape (`{"error": {"code", "message", "type"}}`).
+
 ## Errors
 
 `incompatible_version`, `invalid_request`, `unsupported_operation`,

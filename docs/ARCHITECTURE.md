@@ -50,6 +50,16 @@ flowchart LR
   in one takes down that model only; the router reports it as failed. A crash
   of the router is a worker crash.
 
+## OpenAI-compatible endpoint
+
+For coding tools, `nyx-aid` also listens on `openai_endpoint` (default
+`127.0.0.1:8080`, loopback only; `nyx-aid.socket` holds it so the first request
+starts the daemon). It answers `GET /v1/models` itself and passes `POST /v1/*`
+bodies to the worker unchanged, after taking a lease on the named model through
+the scheduler (so the model loads on demand, waits its turn, and is never
+unloaded mid-reply). Closing the connection cancels the request. Like the old
+`llama-server` on that port it has no key: any local program can use it.
+
 ## Crates
 
 | Crate | Role |

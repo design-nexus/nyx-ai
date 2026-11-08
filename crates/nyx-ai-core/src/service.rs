@@ -805,6 +805,48 @@ impl Service {
         Ok(reply["prompt"].as_str().unwrap_or_default().to_string())
     }
 
+    // ---------- The OpenAI-compatible endpoint ----------
+
+    pub fn openai_addr(&self) -> Option<std::net::SocketAddr> {
+        self.settings.lock().expect("settings").openai_addr()
+    }
+
+    /// `GET /v1/models`: the models a coding tool can use.
+    pub async fn openai_models(&self) -> Value {
+        let data: Vec<Value> = self
+            .list_models()
+            .await
+            .into_iter()
+            .filter(|m| matches!(m.state, ModelState::Installed | ModelState::Ready | ModelState::Busy | ModelState::Loading))
+            .filter(|m| m.has(Capability::Chat) || m.has(Capability::Embedding))
+            .map(|m| {
+                json!({"id": m.id, "object": "model", "created": 0, "owned_by": "nyx-ai",
+                    "meta": {"size": m.size, "context_length": m.context_length, "capabilities": m.capabilities}})
+            })
+            .collect();
+        json!({"object": "list", "data": data})
+    }
+
+    /// Pass one OpenAI-style request to the worker under a lease on its model,
+    /// which loads it if needed. The lease lives as long as the reply is read.
+    pub async fn forward(&self, path: &str, body: &Value, cancel: &CancellationToken) -> Result<(worker::Response, crate::scheduler::Lease), Error> {
+        let model = body["model"].as_str().filter(|m| !m.is_empty()).ok_or_else(|| Error::new(ErrorKind::InvalidRequest, "name a model (GET /v1/models lists them)"))?;
+        let (_, caps) = self.usable(model).await?;
+        let wants = if path.contains("embeddings") { Capability::Embedding } else { Capability::Chat };
+        if !caps.contains(&wants) {
+            return Err(Error::new(ErrorKind::UnsupportedCapability, format!("{model} can't serve {path}")));
+        }
+        Metrics::inc(&self.metrics.requests);
+        let caller = Caller { name: "openai".into(), trusted: false };
+        let lease = self.scheduler.acquire(model, &caller.name, Priority::Normal, cancel, None).await?;
+        let http = self.shared.worker.ready().await?;
+        let response = tokio::select! {
+            r = http.send(Method::POST, path, Some(body)) => r?,
+            _ = cancel.cancelled() => return Err(Error::new(ErrorKind::Cancelled, "cancelled")),
+        };
+        Ok((response, lease))
+    }
+
     fn resource_status(&self) -> ResourceStatus {
         let mem = resources::detect();
         let settings = self.settings.lock().expect("settings").clone();
@@ -848,7 +890,12 @@ impl Service {
 
     fn service_settings(&self) -> ServiceSettings {
         let s = self.settings.lock().expect("settings");
-        ServiceSettings { max_loaded: s.max_loaded, idle_unload_seconds: s.idle_unload_seconds, model_dirs: s.model_dirs.clone() }
+        ServiceSettings {
+            max_loaded: s.max_loaded,
+            idle_unload_seconds: s.idle_unload_seconds,
+            model_dirs: s.model_dirs.clone(),
+            openai_endpoint: s.openai_addr().map(|a| a.to_string()),
+        }
     }
 
     fn configure_service(&self, max_loaded: Option<u32>, idle: Option<i64>) -> Result<ServiceSettings, Error> {

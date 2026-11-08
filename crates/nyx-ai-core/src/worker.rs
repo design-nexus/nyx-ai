@@ -44,6 +44,7 @@ impl Drop for AbortOnDrop {
 /// connection, which stops the worker's work on it.
 pub struct Response {
     pub status: u16,
+    pub content_type: Option<String>,
     body: Incoming,
     _conn: AbortOnDrop,
 }
@@ -129,7 +130,8 @@ impl Http {
             .send_request(request)
             .await
             .map_err(|e| Error::new(ErrorKind::WorkerFailed, format!("llama.cpp dropped the request: {e}")))?;
-        Ok(Response { status: response.status().as_u16(), body: response.into_body(), _conn: task })
+        let content_type = response.headers().get("content-type").and_then(|v| v.to_str().ok()).map(String::from);
+        Ok(Response { status: response.status().as_u16(), content_type, body: response.into_body(), _conn: task })
     }
 
     pub async fn json(&self, method: Method, path: &str, body: Option<&Value>, timeout: Duration) -> Result<Value, Error> {

@@ -67,9 +67,10 @@ systemctl --user daemon-reload 2>/dev/null || true
 if [[ ${NYX_AI_NO_ENABLE:-0} != 1 ]]; then
   systemctl --user enable --now nyx-aid.socket >/dev/null 2>&1 || warn "Couldn't enable nyx-aid.socket; run: systemctl --user enable --now nyx-aid.socket"
 fi
-# A running daemon would keep the old build; it starts again on the next request.
-if systemctl --user is-active -q nyx-aid.service 2>/dev/null; then
-  systemctl --user restart nyx-aid.service || true
+# A running daemon would keep the old build and the socket its old addresses;
+# both start again on the next request.
+if systemctl --user is-active -q nyx-aid.socket 2>/dev/null; then
+  systemctl --user restart nyx-aid.socket || warn "Couldn't restart nyx-aid.socket"
 fi
 
 case ":$PATH:" in

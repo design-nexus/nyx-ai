@@ -3,6 +3,8 @@ Description=Nyx AI Core socket (starts the shared model runtime on first use)
 
 [Socket]
 ListenStream=%t/nyx-ai/ai.sock
+# The OpenAI-compatible API for coding tools (openai_endpoint in settings.toml).
+ListenStream=127.0.0.1:8080
 SocketMode=0600
 DirectoryMode=0700
 

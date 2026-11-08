@@ -198,6 +198,10 @@ async fn run(client: &Client, args: &[String], json: bool, keep: bool, think: bo
                 print_json(&s);
             } else {
                 println!("max_loaded = {}\nidle_unload_seconds = {}\nmodel_dirs = {}", s.max_loaded, s.idle_unload_seconds, s.model_dirs.join(", "));
+                match &s.openai_endpoint {
+                    Some(addr) => println!("openai_endpoint = {addr} (base URL http://{addr}/v1)"),
+                    None => println!("openai_endpoint = off"),
+                }
             }
         }
         "chat" => {

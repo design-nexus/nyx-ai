@@ -14,6 +14,15 @@ nyx-ai pull org/repo:Q4_K_M
 nyx-ai chat org/repo:Q4_K_M "Hello"
 ```
 
+## Coding tools
+
+AI Core serves an OpenAI-compatible API at `http://127.0.0.1:8080/v1` (loopback
+only; systemd starts AI Core on the first request). Point a coding tool there, pick
+a model ID from `GET /v1/models`, and give any placeholder key if it wants one.
+Requests share the scheduler with the Nyx apps: models load on demand and each
+request waits its turn. Set `openai_endpoint = ""` in `settings.toml` to turn it
+off (and drop the `127.0.0.1:8080` line from `nyx-aid.socket`).
+
 - [Architecture](docs/ARCHITECTURE.md)
 - [Protocol](docs/PROTOCOL.md)
 - [PrismML compatibility](docs/PRISM.md)

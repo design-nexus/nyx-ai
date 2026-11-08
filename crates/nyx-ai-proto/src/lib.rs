@@ -807,6 +807,9 @@ pub struct ServiceSettings {
     /// Seconds before an idle, unpinned model unloads; -1 never.
     pub idle_unload_seconds: i64,
     pub model_dirs: Vec<String>,
+    /// The OpenAI-compatible endpoint for coding tools, when it's on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_endpoint: Option<String>,
 }
 
 // ---------- Errors ----------

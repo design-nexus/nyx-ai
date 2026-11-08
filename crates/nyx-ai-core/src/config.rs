@@ -19,6 +19,9 @@ pub struct Settings {
     /// A llama-server to use instead of the installed build.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker: Option<String>,
+    /// Where coding tools reach the OpenAI-compatible API (loopback only); empty
+    /// turns it off. `nyx-aid.socket` listens on the same address.
+    pub openai_endpoint: String,
 }
 
 impl Default for Settings {
@@ -28,6 +31,7 @@ impl Default for Settings {
             idle_unload_seconds: 900,
             model_dirs: vec!["~/.local/share/nyx-ai/models".into(), "~/.local/share/nyx-assistant/models".into()],
             worker: None,
+            openai_endpoint: "127.0.0.1:8080".into(),
         }
     }
 }
@@ -85,6 +89,12 @@ impl Settings {
         Ok(())
     }
 
+    /// The OpenAI-compatible endpoint's address, if it's on and on loopback.
+    pub fn openai_addr(&self) -> Option<std::net::SocketAddr> {
+        let addr: std::net::SocketAddr = self.openai_endpoint.trim().parse().ok()?;
+        addr.ip().is_loopback().then_some(addr)
+    }
+
     pub fn model_dirs(&self) -> Vec<PathBuf> {
         self.model_dirs.iter().map(|d| paths::expand(d)).collect()
     }
@@ -104,6 +114,16 @@ mod tests {
         assert_eq!((s.max_loaded, s.idle_unload_seconds), (2, -1));
         std::fs::write(paths.config_home.join("nyx-chat/settings.toml"), "llama_models_max = 4\n").unwrap();
         assert_eq!(Settings::load(&paths).max_loaded, 2);
+    }
+
+    #[test]
+    fn openai_endpoint_stays_on_loopback() {
+        let mut s = Settings::default();
+        assert_eq!(s.openai_addr().unwrap().to_string(), "127.0.0.1:8080");
+        s.openai_endpoint = "0.0.0.0:8080".into();
+        assert!(s.openai_addr().is_none());
+        s.openai_endpoint = String::new();
+        assert!(s.openai_addr().is_none());
     }
 
     #[test]

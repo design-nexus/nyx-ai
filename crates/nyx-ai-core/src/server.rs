@@ -19,9 +19,16 @@ use tokio_util::sync::CancellationToken;
 const MAX_CONNECTIONS: usize = 64;
 const MAX_REQUESTS: usize = 32;
 
-/// The socket systemd passed (socket activation), or a new one at `path`.
-/// Call before starting threads: it clears systemd's variables.
-pub fn listen(path: &Path) -> std::io::Result<std::os::unix::net::UnixListener> {
+/// What the daemon listens on: its Unix socket, and the TCP socket for the
+/// OpenAI-compatible endpoint when systemd passed one.
+pub struct Listeners {
+    pub unix: std::os::unix::net::UnixListener,
+    pub tcp: Option<std::net::TcpListener>,
+}
+
+/// The sockets systemd passed (socket activation), or a new Unix socket at
+/// `path`. Call before starting threads: it clears systemd's variables.
+pub fn listen(path: &Path) -> std::io::Result<Listeners> {
     let ours = std::env::var("LISTEN_PID").ok().and_then(|p| p.parse::<u32>().ok()) == Some(std::process::id());
     let count = std::env::var("LISTEN_FDS").ok().and_then(|n| n.parse::<i32>().ok()).unwrap_or(0);
     // SAFETY: these variables are only read here, before any other thread looks at them.
@@ -32,10 +39,31 @@ pub fn listen(path: &Path) -> std::io::Result<std::os::unix::net::UnixListener> 
     }
     if ours && count >= 1 {
         use std::os::fd::FromRawFd;
-        // SAFETY: systemd hands us fd 3 as a listening Unix socket.
-        let listener = unsafe { std::os::unix::net::UnixListener::from_raw_fd(3) };
-        listener.set_nonblocking(true)?;
-        return Ok(listener);
+        let (mut unix, mut tcp) = (None, None);
+        for fd in 3..3 + count {
+            // SAFETY: a zeroed sockaddr_storage is valid, and getsockname fills it for the fd systemd passed.
+            let family = unsafe {
+                let mut addr: libc::sockaddr_storage = std::mem::zeroed();
+                let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+                if libc::getsockname(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len) != 0 {
+                    continue;
+                }
+                addr.ss_family as i32
+            };
+            // SAFETY: systemd hands these fds to us as listening sockets.
+            match family {
+                libc::AF_UNIX if unix.is_none() => unix = Some(unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) }),
+                libc::AF_INET | libc::AF_INET6 if tcp.is_none() => tcp = Some(unsafe { std::net::TcpListener::from_raw_fd(fd) }),
+                _ => {}
+            }
+        }
+        if let Some(unix) = unix {
+            unix.set_nonblocking(true)?;
+            if let Some(tcp) = &tcp {
+                tcp.set_nonblocking(true)?;
+            }
+            return Ok(Listeners { unix, tcp });
+        }
     }
     let dir = path.parent().unwrap_or(Path::new("/tmp"));
     std::fs::create_dir_all(dir)?;
@@ -49,10 +77,10 @@ pub fn listen(path: &Path) -> std::io::Result<std::os::unix::net::UnixListener> 
         }
         std::fs::remove_file(path)?;
     }
-    let listener = std::os::unix::net::UnixListener::bind(path)?;
+    let unix = std::os::unix::net::UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    listener.set_nonblocking(true)?;
-    Ok(listener)
+    unix.set_nonblocking(true)?;
+    Ok(Listeners { unix, tcp: None })
 }
 
 /// Serve until `stop` is cancelled.
