@@ -57,6 +57,10 @@ daemon. Lines are at most 64 MiB. A connection may have 32 requests open.
 | `service_settings` | | | `service` |
 | `configure_service` | `max_loaded`, `idle_unload_seconds` (both optional) | | `service` |
 
+`remove_model` deletes cache models only (folder and preset models are refused
+with `permission_denied`). For a model still downloading it stops the download and
+drops its partial files.
+
 ### `chat`
 
 ```json

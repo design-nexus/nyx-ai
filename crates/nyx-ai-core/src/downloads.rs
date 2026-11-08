@@ -130,6 +130,7 @@ fn fetch(client: &reqwest::Client, token: Option<&str>, url: String) -> reqwest:
 
 /// What every file of one download shares.
 struct Job<'a> {
+    endpoint: &'a str,
     client: &'a reqwest::Client,
     token: Option<&'a str>,
     repo: &'a str,
@@ -139,7 +140,7 @@ struct Job<'a> {
 }
 
 async fn download_file(job: &Job<'_>, file: &File, completed: &mut u64, progress: &mut Progress<'_>) -> Result<(), Error> {
-    let Job { client, token, repo, revision, base, total } = *job;
+    let Job { endpoint, client, token, repo, revision, base, total } = *job;
     let io = |e: std::io::Error| Error::new(ErrorKind::DownloadFailed, format!("writing the download: {e}"));
     let oid = &file.lfs.as_ref().expect("checked by selected_files").oid;
     let blob = base.join("blobs").join(oid);
@@ -156,7 +157,7 @@ async fn download_file(job: &Job<'_>, file: &File, completed: &mut u64, progress
         *completed += offset;
         progress.set("Downloading", *completed, total, true);
         if offset < file.size {
-            let url = format!("{}/{repo}/resolve/{revision}/{}", hf::endpoint(), hf::encode_path(&file.path));
+            let url = format!("{endpoint}/{repo}/resolve/{revision}/{}", hf::encode_path(&file.path));
             let mut request = fetch(client, token, url);
             if offset > 0 {
                 request = request.header(RANGE, format!("bytes={offset}-"));
@@ -233,8 +234,8 @@ async fn download_file(job: &Job<'_>, file: &File, completed: &mut u64, progress
     Ok(())
 }
 
-/// Download one model into `cache`.
-pub async fn download(cache: &Path, token: Option<&str>, model: &str, tx: &watch::Sender<Download>) -> Result<(), Error> {
+/// Download one model into `cache` from `endpoint` (Hugging Face).
+pub async fn download(cache: &Path, endpoint: &str, token: Option<&str>, model: &str, tx: &watch::Sender<Download>) -> Result<(), Error> {
     let (repo, quant) = parse_model(model)?;
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
@@ -244,7 +245,7 @@ pub async fn download(cache: &Path, token: Option<&str>, model: &str, tx: &watch
     let mut progress = Progress { tx, last: Instant::now() };
     progress.set("Looking up the model", 0, 0, true);
     let encoded = hf::encode_path(&repo);
-    let info: RepoInfo = fetch(&client, token, format!("{}/api/models/{encoded}", hf::endpoint()))
+    let info: RepoInfo = fetch(&client, token, format!("{endpoint}/api/models/{encoded}"))
         .send()
         .await
         .and_then(|r| r.error_for_status())
@@ -255,7 +256,7 @@ pub async fn download(cache: &Path, token: Option<&str>, model: &str, tx: &watch
     if info.sha.len() != 40 || !info.sha.bytes().all(|c| c.is_ascii_hexdigit()) {
         return Err(Error::new(ErrorKind::DownloadFailed, "Hugging Face returned an invalid revision"));
     }
-    let tree: Vec<File> = fetch(&client, token, format!("{}/api/models/{encoded}/tree/{}?recursive=true", hf::endpoint(), info.sha))
+    let tree: Vec<File> = fetch(&client, token, format!("{endpoint}/api/models/{encoded}/tree/{}?recursive=true", info.sha))
         .send()
         .await
         .and_then(|r| r.error_for_status())
@@ -285,7 +286,7 @@ pub async fn download(cache: &Path, token: Option<&str>, model: &str, tx: &watch
         ));
     }
     let mut completed = 0;
-    let job = Job { client: &client, token, repo: &repo, revision: &info.sha, base: &base, total };
+    let job = Job { endpoint, client: &client, token, repo: &repo, revision: &info.sha, base: &base, total };
     for file in &files {
         download_file(&job, file, &mut completed, &mut progress).await?;
     }
@@ -304,6 +305,7 @@ struct Entry {
 /// model list).
 pub struct Downloads {
     cache: PathBuf,
+    endpoint: String,
     config_home: PathBuf,
     entries: Mutex<Vec<Entry>>,
     on_done: Box<dyn Fn() + Send + Sync>,
@@ -311,7 +313,7 @@ pub struct Downloads {
 
 impl Downloads {
     pub fn new(cache: PathBuf, config_home: PathBuf, on_done: impl Fn() + Send + Sync + 'static) -> Arc<Downloads> {
-        Arc::new(Downloads { cache, config_home, entries: Mutex::new(Vec::new()), on_done: Box::new(on_done) })
+        Arc::new(Downloads { cache, endpoint: hf::endpoint(), config_home, entries: Mutex::new(Vec::new()), on_done: Box::new(on_done) })
     }
 
     /// Queue a download (or join the one already going) and watch it.
@@ -377,7 +379,7 @@ impl Downloads {
             let model = tx.borrow().model.clone();
             let token = hf::token(&me.config_home);
             tracing::info!(%model, "download started");
-            let result = download(&me.cache, token.as_deref(), &model, &tx).await;
+            let result = download(&me.cache, &me.endpoint, token.as_deref(), &model, &tx).await;
             tx.send_modify(|d| match &result {
                 Ok(()) => {
                     d.state = DownloadState::Done;
@@ -406,6 +408,25 @@ impl Downloads {
         });
         entry.abort = Some(task.abort_handle());
     }
+}
+
+/// Drop the partial files of a download that never finished, and the
+/// repository's folder if nothing finished in it either. Returns whether there
+/// was anything to drop.
+pub fn discard_partial(cache: &Path, model: &str) -> bool {
+    let Ok((repo, _)) = parse_model(model) else { return false };
+    let base = repo_dir(cache, &repo);
+    let mut found = false;
+    for entry in std::fs::read_dir(base.join("blobs")).into_iter().flatten().flatten() {
+        if entry.file_name().to_string_lossy().ends_with(".incomplete") {
+            found |= std::fs::remove_file(entry.path()).is_ok();
+        }
+    }
+    let finished = std::fs::read_dir(base.join("snapshots")).is_ok_and(|mut d| d.next().is_some());
+    if found && !finished {
+        let _ = std::fs::remove_dir_all(&base);
+    }
+    found
 }
 
 fn active(state: DownloadState) -> bool {
@@ -448,5 +469,115 @@ mod tests {
     #[test]
     fn measures_free_space() {
         assert!(free_space(Path::new("/tmp/does/not/exist")).is_some_and(|f| f > 0));
+    }
+
+    /// A Hugging Face stand-in serving one repository `o/r` with one file.
+    async fn fake_hub(body: Vec<u8>, oid: String) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use http_body_util::Full;
+        use hyper::{Response, body::Bytes};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let ranges = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = ranges.clone();
+        let sha = "a".repeat(40);
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let (body, oid, sha, seen) = (body.clone(), oid.clone(), sha.clone(), seen.clone());
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(move |req: hyper::Request<hyper::body::Incoming>| {
+                        let (body, oid, sha, seen) = (body.clone(), oid.clone(), sha.clone(), seen.clone());
+                        async move {
+                            let path = req.uri().path().to_string();
+                            let reply = if path == "/api/models/o/r" {
+                                Response::new(Full::new(Bytes::from(format!("{{\"sha\":\"{sha}\"}}"))))
+                            } else if path.starts_with("/api/models/o/r/tree/") {
+                                let tree = format!("[{{\"path\":\"m-Q4_0.gguf\",\"size\":{},\"lfs\":{{\"oid\":\"{oid}\"}}}},{{\"path\":\"README.md\",\"size\":3}}]", body.len());
+                                Response::new(Full::new(Bytes::from(tree)))
+                            } else if path == format!("/o/r/resolve/{sha}/m-Q4_0.gguf") {
+                                let start = req
+                                    .headers()
+                                    .get("range")
+                                    .and_then(|r| r.to_str().ok()?.strip_prefix("bytes=")?.strip_suffix('-')?.parse::<usize>().ok());
+                                match start {
+                                    Some(start) => {
+                                        seen.fetch_add(1, Ordering::SeqCst);
+                                        let mut r = Response::new(Full::new(Bytes::from(body[start..].to_vec())));
+                                        *r.status_mut() = hyper::StatusCode::PARTIAL_CONTENT;
+                                        r
+                                    }
+                                    None => Response::new(Full::new(Bytes::from(body))),
+                                }
+                            } else {
+                                let mut r = Response::new(Full::new(Bytes::new()));
+                                *r.status_mut() = hyper::StatusCode::NOT_FOUND;
+                                r
+                            };
+                            Ok::<_, std::convert::Infallible>(reply)
+                        }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new().serve_connection(hyper_util::rt::TokioIo::new(stream), service).await;
+                });
+            }
+        });
+        (format!("http://{addr}"), ranges)
+    }
+
+    fn model_file() -> (Vec<u8>, String) {
+        let mut body = b"GGUF\x03\0\0\0".to_vec();
+        body.extend((0..200_000u32).map(|i| (i % 251) as u8));
+        let oid = format!("{:x}", Sha256::digest(&body));
+        (body, oid)
+    }
+
+    use std::sync::atomic::Ordering;
+
+    fn progress() -> watch::Sender<Download> {
+        watch::channel(Download { model: "o/r:Q4_0".into(), state: DownloadState::Running, status: String::new(), completed: 0, total: 0, error: None }).0
+    }
+
+    #[tokio::test]
+    async fn downloads_resumes_and_checks() {
+        let (body, oid) = model_file();
+        let (endpoint, ranges) = fake_hub(body.clone(), oid.clone()).await;
+        let cache = tempfile::tempdir().unwrap();
+        let base = repo_dir(cache.path(), "o/r");
+        std::fs::create_dir_all(base.join("blobs")).unwrap();
+        std::fs::write(base.join("blobs").join(format!("{oid}.incomplete")), &body[..50_000]).unwrap();
+        let tx = progress();
+        download(cache.path(), &endpoint, None, "o/r:q4_0", &tx).await.unwrap();
+        assert_eq!(ranges.load(Ordering::SeqCst), 1, "it resumed from the partial file");
+        assert_eq!(std::fs::read(base.join("blobs").join(&oid)).unwrap(), body);
+        let snapshot = base.join("snapshots").join("a".repeat(40)).join("m-Q4_0.gguf");
+        assert_eq!(std::fs::read(&snapshot).unwrap(), body);
+        assert_eq!(std::fs::read_to_string(base.join("refs/main")).unwrap(), "a".repeat(40));
+        assert_eq!((tx.borrow().completed, tx.borrow().total), (body.len() as u64, body.len() as u64));
+        assert_eq!(hf::cached_file(cache.path(), "o/r:Q4_0").unwrap(), snapshot);
+
+        let (endpoint, _) = fake_hub(body.clone(), "b".repeat(64)).await;
+        let other = tempfile::tempdir().unwrap();
+        let err = download(other.path(), &endpoint, None, "o/r:Q4_0", &progress()).await.unwrap_err();
+        assert!(err.message.contains("checksum mismatch"), "{err:?}");
+        assert!(!repo_dir(other.path(), "o/r").join("blobs").join(format!("{}.incomplete", "b".repeat(64))).exists());
+
+        let err = download(other.path(), &endpoint, None, "o/r:Q8_0", &progress()).await.unwrap_err();
+        assert!(err.message.contains("not in the Hugging Face repository"));
+    }
+
+    #[test]
+    fn discards_unfinished_downloads_only() {
+        let cache = tempfile::tempdir().unwrap();
+        let base = repo_dir(cache.path(), "o/r");
+        std::fs::create_dir_all(base.join("blobs")).unwrap();
+        std::fs::write(base.join("blobs/x.incomplete"), b"part").unwrap();
+        assert!(discard_partial(cache.path(), "o/r:Q4_0"));
+        assert!(!base.exists());
+        std::fs::create_dir_all(base.join("snapshots/rev")).unwrap();
+        std::fs::create_dir_all(base.join("blobs")).unwrap();
+        std::fs::write(base.join("blobs/y.incomplete"), b"part").unwrap();
+        std::fs::write(base.join("blobs/done"), b"whole").unwrap();
+        assert!(discard_partial(cache.path(), "o/r:Q8_0"));
+        assert!(base.join("blobs/done").exists() && !base.join("blobs/y.incomplete").exists());
+        assert!(!discard_partial(cache.path(), "o/r:Q8_0"));
     }
 }

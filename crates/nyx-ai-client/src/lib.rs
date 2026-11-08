@@ -265,8 +265,8 @@ impl Connection {
         self.writer.flush().await.map_err(lost)
     }
 
+    /// Cancel-safe: a partial line stays buffered for the next call.
     async fn read(&mut self) -> Result<ServerLine> {
-        self.line.clear();
         loop {
             let buf = self.reader.fill_buf().await.map_err(lost)?;
             if buf.is_empty() {
@@ -282,7 +282,8 @@ impl Connection {
                 return Err(Error::new(ErrorKind::Internal, "reply line too long"));
             }
             if end {
-                return serde_json::from_slice(&self.line)
+                let line = std::mem::take(&mut self.line);
+                return serde_json::from_slice(&line)
                     .map_err(|e| Error::new(ErrorKind::Internal, format!("unreadable reply from Nyx AI Core: {e}")));
             }
         }

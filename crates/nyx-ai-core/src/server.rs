@@ -111,9 +111,8 @@ struct Lines {
 }
 
 impl Lines {
-    /// The next line, `None` at the end; too long is an error.
+    /// The next line, `None` at the end; too long is an error. Cancel-safe.
     async fn next(&mut self) -> std::io::Result<Option<String>> {
-        self.line.clear();
         loop {
             let buf = self.reader.fill_buf().await?;
             if buf.is_empty() {
@@ -129,7 +128,8 @@ impl Lines {
                 return Err(std::io::Error::other("line too long"));
             }
             if end {
-                return Ok(Some(String::from_utf8_lossy(&self.line).trim().to_string()));
+                let line = std::mem::take(&mut self.line);
+                return Ok(Some(String::from_utf8_lossy(&line).trim().to_string()));
             }
         }
     }

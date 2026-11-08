@@ -521,7 +521,14 @@ impl Service {
     async fn remove(&self, id: &str) -> Result<(), Error> {
         valid_model_id(id).map_err(|e| Error::new(ErrorKind::InvalidRequest, e))?;
         let records = self.records().await;
-        let record = records.get(id).ok_or_else(|| Error::new(ErrorKind::UnknownModel, format!("{id} isn't installed")))?;
+        let Some(record) = records.get(id) else {
+            let stopped = self.downloads.cancel(id);
+            if crate::downloads::discard_partial(&self.shared.paths.cache, id) || stopped {
+                tracing::info!(model = %id, "unfinished download removed");
+                return Ok(());
+            }
+            return Err(Error::new(ErrorKind::UnknownModel, format!("{id} isn't installed")));
+        };
         if record.source != Source::Cache {
             return Err(Error::new(
                 ErrorKind::PermissionDenied,

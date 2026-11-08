@@ -223,18 +223,16 @@ impl Registry {
         let mut fresh = BTreeMap::new();
         for item in items {
             let folder = folders.get(&item.id);
+            // A cached model with its own section in models.ini lists as a preset.
+            let cached = if folder.is_none() && item.path.is_none() { hf::cached_file(&self.paths.cache, &item.id) } else { None };
             let source = if folder.is_some() {
                 Source::Folder
-            } else if item.source.as_deref() == Some("preset") {
+            } else if item.source.as_deref() == Some("preset") && cached.is_none() {
                 Source::Preset
             } else {
                 Source::Cache
             };
-            let path = item
-                .path
-                .clone()
-                .or_else(|| folder.map(|f| f.path.clone()))
-                .or_else(|| (source == Source::Cache).then(|| hf::cached_file(&self.paths.cache, &item.id)).flatten());
+            let path = item.path.clone().or_else(|| folder.map(|f| f.path.clone())).or(cached);
             let mut record = Record {
                 source,
                 size: path.as_deref().map(total_size).unwrap_or(0),
