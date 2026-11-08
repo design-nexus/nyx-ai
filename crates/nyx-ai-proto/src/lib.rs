@@ -148,6 +148,12 @@ pub enum Op {
         max_loaded: Option<u32>,
         #[serde(default)]
         idle_unload_seconds: Option<i64>,
+        /// `auto`, `notify` or `off`.
+        #[serde(default)]
+        model_updates: Option<String>,
+        /// Default models by role (see [`ROLES`]); an empty model clears a role.
+        #[serde(default)]
+        defaults: Option<BTreeMap<String, String>>,
     },
 }
 
@@ -375,6 +381,11 @@ pub enum ResponseFormat {
     JsonObject,
     JsonSchema { schema: Value },
 }
+
+/// What a default model is for: `chat` (new chats), `assistant`, `embedding`
+/// (search and knowledge bases) and `coding` (the OpenAI-compatible API when a
+/// request names no model).
+pub const ROLES: &[&str] = &["chat", "assistant", "embedding", "coding"];
 
 pub const REASONING_EFFORTS: &[&str] = &["minimal", "low", "medium", "high", "xhigh", "max"];
 
@@ -823,6 +834,9 @@ pub struct ServiceSettings {
     /// `auto`, `notify` or `off`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_updates: Option<String>,
+    /// Default models by role.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub defaults: BTreeMap<String, String>,
 }
 
 // ---------- Errors ----------
@@ -911,7 +925,12 @@ mod tests {
                 ..Default::default()
             }),
             Op::Embed { model: "e".into(), input: vec!["a".into()], priority: Priority::Background },
-            Op::ConfigureService { max_loaded: Some(2), idle_unload_seconds: None },
+            Op::ConfigureService {
+                max_loaded: Some(2),
+                idle_unload_seconds: None,
+                model_updates: Some("notify".into()),
+                defaults: Some([("chat".to_string(), "org/m:Q4_K_M".to_string())].into()),
+            },
             Op::CheckUpdates {},
         ];
         for op in ops {

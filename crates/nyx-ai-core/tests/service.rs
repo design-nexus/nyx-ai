@@ -300,6 +300,23 @@ async fn openai_endpoint_for_coding_tools() {
     assert_eq!(status(serde_json::json!({"model": "org/embed:Q8_0", "input": ["x"]}), "/v1/embeddings").await, 200);
     assert_eq!(http.get(format!("{base}/v1/secret")).send().await.unwrap().status(), 400);
 
+    // Without a model, the coding default answers; defaults must fit their role.
+    let unnamed = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
+    assert_eq!(status(unnamed.clone(), "/v1/chat/completions").await, 400);
+    let set = |role: &str, model: &str| nyx_ai_client::proto::Op::ConfigureService {
+        max_loaded: None,
+        idle_unload_seconds: None,
+        model_updates: None,
+        defaults: Some([(role.to_string(), model.to_string())].into()),
+    };
+    let s = h.client.configure_service_with(set("coding", "org/chat:Q4_K_M")).await.unwrap();
+    assert_eq!(s.defaults["coding"], "org/chat:Q4_K_M");
+    assert_eq!(status(unnamed, "/v1/chat/completions").await, 200);
+    assert_eq!(h.client.configure_service_with(set("embedding", "org/chat:Q4_K_M")).await.unwrap_err().kind, ErrorKind::UnsupportedCapability);
+    assert_eq!(h.client.configure_service_with(set("chat", "org/none:Q4_0")).await.unwrap_err().kind, ErrorKind::UnknownModel);
+    assert_eq!(h.client.configure_service_with(set("lunch", "org/chat:Q4_K_M")).await.unwrap_err().kind, ErrorKind::InvalidRequest);
+    assert!(h.client.configure_service_with(set("coding", "")).await.unwrap().defaults.is_empty());
+
     let slow = serde_json::json!({"model": "org/chat:Q4_K_M", "stream": true, "messages": [{"role": "user", "content": "count:500"}]});
     let mut reply = http.post(format!("{base}/v1/chat/completions")).json(&slow).send().await.unwrap();
     assert!(reply.chunk().await.unwrap().is_some());

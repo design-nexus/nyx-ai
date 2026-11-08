@@ -240,7 +240,12 @@ impl Client {
     }
 
     pub async fn configure_service(&self, max_loaded: Option<u32>, idle_unload_seconds: Option<i64>) -> Result<ServiceSettings> {
-        match self.call(Op::ConfigureService { max_loaded, idle_unload_seconds }).await? {
+        self.configure_service_with(Op::ConfigureService { max_loaded, idle_unload_seconds, model_updates: None, defaults: None }).await
+    }
+
+    /// Any of `configure_service`'s settings (`op` is an `Op::ConfigureService`).
+    pub async fn configure_service_with(&self, op: Op) -> Result<ServiceSettings> {
+        match self.call(op).await? {
             Reply::Service(s) => Ok(s),
             other => Err(unexpected(&other)),
         }

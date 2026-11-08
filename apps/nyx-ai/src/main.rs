@@ -20,8 +20,11 @@ const USAGE: &str = "Usage: nyx-ai COMMAND [--json]
   load MODEL [--keep]          load now (--keep: until unload)
   unload MODEL                 unload unless something else uses it
   settings MODEL|* [KEY=VALUE…] show or change load-time settings (empty value removes)
-  service [max_loaded=N] [idle=SECONDS]
-                               show or change how many models stay loaded and for how long
+  service [max_loaded=N] [idle=SECONDS] [updates=auto|notify|off]
+                               show or change how many models stay loaded, for how long,
+                               and whether models update themselves
+  default ROLE [MODEL]         show or set the default model for a role (chat, assistant,
+                               embedding, coding); \"\" clears it
   chat MODEL PROMPT…           ask a model (--think to show its reasoning)
   embed MODEL TEXT…            embed texts
   capabilities                 what this Nyx AI Core supports";
@@ -142,7 +145,10 @@ async fn run(client: &Client, args: &[String], json: bool, keep: bool, think: bo
             let mut stream = client.download_model(model).await?;
             while let Some(item) = stream.next().await {
                 match item? {
-                    Item::Event(Event::Progress { status, completed, total }) if !json => {
+                    Item::Event(Event::Progress { status, completed, total }) if json => {
+                        println!("{}", json!({"status": status, "completed": completed, "total": total}));
+                    }
+                    Item::Event(Event::Progress { status, completed, total }) => {
                         if total > 0 {
                             eprint!("\r{status}: {} of {} ({}%)   ", gb(completed), gb(total), completed * 100 / total);
                         } else {
@@ -205,23 +211,61 @@ async fn run(client: &Client, args: &[String], json: bool, keep: bool, think: bo
         "service" => {
             let mut max = None;
             let mut idle = None;
+            let mut updates = None;
             for kv in &args[1..] {
                 match kv.split_once('=') {
                     Some(("max_loaded", v)) => max = v.parse().ok(),
                     Some(("idle", v)) | Some(("idle_unload_seconds", v)) => idle = v.parse().ok(),
+                    Some(("updates", v)) | Some(("model_updates", v)) => updates = Some(v.to_string()),
                     _ => {}
                 }
             }
-            let s = if max.is_none() && idle.is_none() { client.service_settings().await? } else { client.configure_service(max, idle).await? };
+            let s = if max.is_none() && idle.is_none() && updates.is_none() {
+                client.service_settings().await?
+            } else {
+                client
+                    .configure_service_with(nyx_ai_client::proto::Op::ConfigureService {
+                        max_loaded: max,
+                        idle_unload_seconds: idle,
+                        model_updates: updates,
+                        defaults: None,
+                    })
+                    .await?
+            };
             if json {
                 print_json(&s);
             } else {
                 println!("max_loaded = {}\nidle_unload_seconds = {}\nmodel_dirs = {}", s.max_loaded, s.idle_unload_seconds, s.model_dirs.join(", "));
                 println!("model_updates = {}", s.model_updates.as_deref().unwrap_or("auto"));
+                for (role, model) in &s.defaults {
+                    println!("default.{role} = {model}");
+                }
                 match &s.openai_endpoint {
                     Some(addr) => println!("openai_endpoint = {addr} (base URL http://{addr}/v1)"),
                     None => println!("openai_endpoint = off"),
                 }
+            }
+        }
+        "default" => {
+            let role = need(args, 1, "ROLE")?.to_string();
+            let s = match args.get(2) {
+                None => client.service_settings().await?,
+                Some(model) => {
+                    client
+                        .configure_service_with(nyx_ai_client::proto::Op::ConfigureService {
+                            max_loaded: None,
+                            idle_unload_seconds: None,
+                            model_updates: None,
+                            defaults: Some([(role.clone(), model.clone())].into()),
+                        })
+                        .await?
+                }
+            };
+            let model = s.defaults.get(&role).cloned().unwrap_or_default();
+            if json {
+                print_json(&json!({"role": role, "model": model}));
+            } else {
+                println!("{}", if model.is_empty() { "none".to_string() } else { model });
             }
         }
         "chat" => {

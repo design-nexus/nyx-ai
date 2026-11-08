@@ -499,7 +499,9 @@ impl Service {
             Op::ListCapabilities {} => Ok(Reply::Capabilities(self.capabilities())),
             Op::ServiceSettings {} => Ok(Reply::Service(self.service_settings())),
             Op::CheckUpdates {} => Ok(Reply::Models { models: self.check_updates().await }),
-            Op::ConfigureService { max_loaded, idle_unload_seconds } => self.configure_service(max_loaded, idle_unload_seconds).map(Reply::Service),
+            Op::ConfigureService { max_loaded, idle_unload_seconds, model_updates, defaults } => {
+                self.configure_service(max_loaded, idle_unload_seconds, model_updates, defaults).await.map(Reply::Service)
+            }
         }
     }
 
@@ -973,7 +975,18 @@ impl Service {
     /// Pass one OpenAI-style request to the worker under a lease on its model,
     /// which loads it if needed. The lease lives as long as the reply is read.
     pub async fn forward(&self, path: &str, body: &Value, cancel: &CancellationToken) -> Result<(worker::Response, crate::scheduler::Lease), Error> {
-        let model = body["model"].as_str().filter(|m| !m.is_empty()).ok_or_else(|| Error::new(ErrorKind::InvalidRequest, "name a model (GET /v1/models lists them)"))?;
+        let mut body = body.clone();
+        if body["model"].as_str().is_none_or(str::is_empty) {
+            let role = if path.contains("embeddings") { "embedding" } else { "coding" };
+            if let Some(model) = self.settings.lock().expect("settings").defaults.get(role) {
+                body["model"] = json!(model);
+            }
+        }
+        let body = &body;
+        let model = body["model"]
+            .as_str()
+            .filter(|m| !m.is_empty())
+            .ok_or_else(|| Error::new(ErrorKind::InvalidRequest, "name a model (GET /v1/models lists them), or set a default coding model"))?;
         let (_, caps) = self.usable(model).await?;
         let wants = if path.contains("embeddings") { Capability::Embedding } else { Capability::Chat };
         if !caps.contains(&wants) {
@@ -1039,17 +1052,56 @@ impl Service {
             model_dirs: s.model_dirs.clone(),
             openai_endpoint: s.openai_addr().map(|a| a.to_string()),
             model_updates: Some(s.model_updates.clone()),
+            defaults: s.defaults.clone(),
         }
     }
 
-    fn configure_service(&self, max_loaded: Option<u32>, idle: Option<i64>) -> Result<ServiceSettings, Error> {
+    async fn configure_service(
+        &self,
+        max_loaded: Option<u32>,
+        idle: Option<i64>,
+        updates: Option<String>,
+        defaults: Option<BTreeMap<String, String>>,
+    ) -> Result<ServiceSettings, Error> {
+        let invalid = |m: String| Error::new(ErrorKind::InvalidRequest, m);
         if max_loaded.is_some_and(|n| !(1..=crate::config::MAX_LOADED_LIMIT).contains(&n)) {
-            return Err(Error::new(ErrorKind::InvalidRequest, format!("max_loaded must be 1 to {}", crate::config::MAX_LOADED_LIMIT)));
+            return Err(invalid(format!("max_loaded must be 1 to {}", crate::config::MAX_LOADED_LIMIT)));
         }
         if idle.is_some_and(|n| n < -1) {
-            return Err(Error::new(ErrorKind::InvalidRequest, "idle_unload_seconds must be -1 (never) or more"));
+            return Err(invalid("idle_unload_seconds must be -1 (never) or more".into()));
+        }
+        if updates.as_deref().is_some_and(|u| !matches!(u, "auto" | "notify" | "off")) {
+            return Err(invalid("model_updates must be auto, notify or off".into()));
+        }
+        if let Some(defaults) = &defaults {
+            let records = self.records().await;
+            for (role, model) in defaults {
+                if !nyx_ai_proto::ROLES.contains(&role.as_str()) {
+                    return Err(invalid(format!("no role {role}; roles are {}", nyx_ai_proto::ROLES.join(", "))));
+                }
+                if model.is_empty() {
+                    continue;
+                }
+                let record = records.get(model).filter(|r| !r.missing).ok_or_else(|| Error::new(ErrorKind::UnknownModel, format!("{model} isn't installed")))?;
+                let needs = if role == "embedding" { Capability::Embedding } else { Capability::Chat };
+                if !record.capabilities().contains(&needs) {
+                    return Err(Error::new(ErrorKind::UnsupportedCapability, format!("{model} can't be the {role} model")));
+                }
+            }
         }
         let mut settings = self.settings.lock().expect("settings");
+        if let Some(u) = updates {
+            settings.model_updates = u;
+        }
+        if let Some(defaults) = defaults {
+            for (role, model) in defaults {
+                if model.is_empty() {
+                    settings.defaults.remove(&role);
+                } else {
+                    settings.defaults.insert(role, model);
+                }
+            }
+        }
         if let Some(n) = max_loaded {
             settings.max_loaded = n;
         }

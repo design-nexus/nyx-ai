@@ -28,6 +28,8 @@ pub struct Settings {
     pub update_check_hours: u64,
     /// Companion files downloads include: `mmproj`, `mtp`, `dflash`, `eagle3`, `dspark`.
     pub sidecars: Vec<String>,
+    /// Default models by role (`chat`, `assistant`, `embedding`, `coding`).
+    pub defaults: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for Settings {
@@ -41,6 +43,7 @@ impl Default for Settings {
             model_updates: "auto".into(),
             update_check_hours: 24,
             sidecars: vec!["mmproj".into(), "mtp".into()],
+            defaults: Default::default(),
         }
     }
 }
@@ -92,6 +95,7 @@ impl Settings {
         self.update_check_hours = self.update_check_hours.clamp(1, 24 * 30);
         self.sidecars.retain(|k| crate::hf::SIDECARS.contains(&k.as_str()));
         self.sidecars.dedup();
+        self.defaults.retain(|role, model| nyx_ai_proto::ROLES.contains(&role.as_str()) && nyx_ai_proto::valid_model_id(model).is_ok());
         self
     }
 

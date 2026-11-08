@@ -55,7 +55,7 @@ daemon. Lines are at most 64 MiB. A connection may have 32 requests open.
 | `worker_status` | | | `worker` |
 | `list_capabilities` | | | `capabilities` |
 | `service_settings` | | | `service` |
-| `configure_service` | `max_loaded`, `idle_unload_seconds` (both optional) | | `service` |
+| `configure_service` | `max_loaded`, `idle_unload_seconds`, `model_updates`, `defaults` (`{role: model}`, `""` clears) (all optional) | | `service` |
 | `check_updates` | | | `models` (those with `update_available`) |
 
 ### Updates
@@ -162,4 +162,12 @@ shape (`{"error": {"code", "message", "type"}}`).
 
 - Version 1 (November 2026): first release.
 - Version 1, additions: `check_updates`; `Model.update_available` and
-  `update_size`; `ServiceSettings.openai_endpoint` and `model_updates`.
+  `update_size`; `ServiceSettings.openai_endpoint`, `model_updates` and
+  `defaults`; `configure_service`'s `model_updates` and `defaults`.
+
+## Default models
+
+`defaults` names a model for each role: `chat` (new chats in apps without a pick of
+their own), `assistant`, `embedding` (search and knowledge bases) and `coding` (the
+OpenAI-compatible API uses it when a request names no model; `embedding` serves
+`/v1/embeddings` the same way). A default must be installed and able to do its role.
