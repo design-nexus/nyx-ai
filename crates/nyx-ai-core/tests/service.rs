@@ -193,6 +193,57 @@ async fn embeddings_evict_the_chat_model_and_check_capabilities() {
     h.stop().await;
 }
 
+/// The apps of Handoff 05 at once: Chat and the Assistant chatting on one model, and
+/// Glimpse indexing in the background on another. With one model loaded at a time,
+/// both chats finish, the indexing waits for them rather than taking the model away
+/// mid-reply, and each app's connection sees only its own requests.
+#[tokio::test(flavor = "multi_thread")]
+async fn chat_assistant_and_glimpse_share_ai_core() {
+    let h = Harness::start().await;
+    let chat = Client::with_socket("nyx-chat", &h.paths.socket);
+    let assistant = Client::with_socket("nyx-assistant", &h.paths.socket);
+    let glimpse = Client::with_socket("nyx-glimpse", &h.paths.socket);
+    let ask_long = |text: &str| ChatRequest { model: "org/chat:Q4_K_M".into(), messages: vec![Message::text(Role::User, text)], priority: Priority::Interactive, ..Default::default() };
+    // Chat's reply is under way before the others arrive.
+    let mut chat_stream = chat.chat(ask_long("count:40")).await.unwrap();
+    while !matches!(chat_stream.next().await.unwrap().unwrap(), Item::Event(Event::Delta { .. })) {}
+    let indexing = tokio::spawn({
+        let glimpse = glimpse.clone();
+        async move { glimpse.embed("org/embed:Q8_0", vec!["notes".into(), "photos".into()], Priority::Background).await }
+    });
+    let spoken = tokio::spawn({
+        let assistant = assistant.clone();
+        async move { assistant.chat(ask("org/chat:Q4_K_M", "what's next")).await.unwrap().collect_chat().await }
+    });
+    let mut chat_text = String::new();
+    let chat_done = loop {
+        match chat_stream.next().await.unwrap().unwrap() {
+            Item::Event(Event::Delta { content, .. }) => chat_text.push_str(&content),
+            Item::Event(_) => {}
+            Item::Done(reply) => break reply,
+        }
+    };
+    assert!(matches!(chat_done, nyx_ai_client::proto::Reply::Finished(_)), "Chat's reply finished whole");
+    let answer = spoken.await.unwrap().unwrap();
+    assert!(!answer.content.is_empty(), "the Assistant's turn finished");
+    let vectors = indexing.await.unwrap().unwrap();
+    assert_eq!(vectors.vectors.len(), 2, "Glimpse's indexing ran after the chats");
+    let m = h.client.worker_status().await.unwrap().metrics;
+    assert!(m.evictions >= 1, "one model at a time: the embedding model replaced the chat model once it was free");
+    // Cancelling is per connection: the Assistant can't cancel Chat's request.
+    let mut chat_again = chat.chat(ask_long("count:200")).await.unwrap();
+    while !matches!(chat_again.next().await.unwrap().unwrap(), Item::Event(Event::Delta { .. })) {}
+    let stranger = raw(&h.paths.socket, &[
+        encode(&ClientLine::Hello(Hello { api_version: nyx_ai_client::proto::API_VERSION, client: "nyx-assistant".into() })),
+        encode(&ClientLine::Request(Box::new(nyx_ai_client::proto::Request { id: 9, op: Op::Cancel { request: 1 } }))),
+    ])
+    .await;
+    assert!(!stranger.iter().any(|l| matches!(l, ServerLine::Error { error, .. } if error.kind == ErrorKind::Cancelled)));
+    assert!(matches!(chat_again.next().await, Some(Ok(Item::Event(Event::Delta { .. })))), "Chat's reply goes on");
+    chat_again.cancel().await.unwrap();
+    h.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_and_disconnect_stop_generation() {
     let h = Harness::start().await;
