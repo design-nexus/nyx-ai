@@ -7,6 +7,7 @@ ListenStream=%t/nyx-ai/ai.sock
 ListenStream=127.0.0.1:8080
 SocketMode=0600
 DirectoryMode=0700
+RemoveOnStop=yes
 
 [Install]
 WantedBy=sockets.target

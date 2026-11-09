@@ -5,7 +5,7 @@ use nyx_ai_client::proto::{ChatRequest, EmbedInput, Event, Message, Priority, Re
 use nyx_ai_client::{Client, Item};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::process::ExitCode;
 
 const USAGE: &str = "Usage: nyx-ai COMMAND [--json]
@@ -44,6 +44,11 @@ fn print_json(value: &impl serde::Serialize) {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> ExitCode {
+    // SAFETY: restoring the default SIGPIPE before any other thread exists, so a closed
+    // pipe (`nyx-ai models | head`) ends the program quietly instead of panicking.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let json = take_flag(&mut args, "--json");
     let keep = take_flag(&mut args, "--keep");
@@ -157,23 +162,28 @@ async fn run(client: &Client, args: &[String], flags: Flags) -> nyx_ai_client::R
         "pull" => {
             let model = need(args, 1, "ORG/REPO:QUANT")?;
             let mut stream = client.download_model(model).await?;
+            let tty = std::io::stderr().is_terminal();
+            let mut shown: Option<(String, u64)> = None;
             while let Some(item) = stream.next().await {
                 match item? {
                     Item::Event(Event::Progress { status, completed, total }) if json => {
                         println!("{}", json!({"status": status, "completed": completed, "total": total}));
                     }
                     Item::Event(Event::Progress { status, completed, total }) => {
-                        if total > 0 {
-                            eprint!("\r{status}: {} of {} ({}%)   ", gb(completed), gb(total), completed * 100 / total);
-                        } else {
-                            eprint!("\r{status}…   ");
+                        let percent = (completed * 100).checked_div(total).unwrap_or(0);
+                        let line = if total > 0 { format!("{status}: {} of {} ({percent}%)", gb(completed), gb(total)) } else { format!("{status}…") };
+                        if tty {
+                            eprint!("\r{line}   ");
+                        } else if shown.as_ref().is_none_or(|(s, p)| *s != status || p / 10 != percent / 10) {
+                            eprintln!("{line}");
+                            shown = Some((status, percent));
                         }
                     }
                     Item::Done(_) => {
                         if json {
                             print_json(&json!({"ok": true}));
                         } else {
-                            eprintln!("\rDownloaded {model}.                         ");
+                            eprintln!("{}Downloaded {model}.", if tty { "\r\x1b[K" } else { "" });
                         }
                     }
                     _ => {}
