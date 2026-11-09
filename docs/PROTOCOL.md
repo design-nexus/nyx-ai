@@ -55,7 +55,7 @@ daemon. Lines are at most 64 MiB. A connection may have 32 requests open.
 | `worker_status` | | | `worker` |
 | `list_capabilities` | | | `capabilities` |
 | `service_settings` | | | `service` |
-| `configure_service` | `max_loaded`, `idle_unload_seconds`, `model_updates`, `defaults` (`{role: model}`, `""` clears), `battery_saver` (all optional) | | `service` |
+| `configure_service` | `max_loaded`, `idle_unload_seconds`, `model_updates`, `defaults` (`{role: model}`, `""` clears), `battery_saver`, `add_model_dirs` (folders to list models from as well; absolute or under `~/`) (all optional) | | `service` |
 | `check_updates` | | | `models` (those with `update_available`) |
 | `list_actions` | | | `actions` |
 | `invoke_action` | `action`, `arguments` (JSON), `confirmed` | | `action_done` (`result`) |
@@ -230,6 +230,10 @@ shape (`{"error": {"code", "message", "type"}}`).
   `image-min-tokens` and `image-max-tokens`.
 - Version 1, additions: `ChatRequest.grammar`; `configure_service`'s
   `battery_saver`; `ServiceSettings.battery_saver`, `on_battery` and `cpu_only`.
+- Version 1, additions: `configure_service`'s `add_model_dirs` (an app's own model
+  folder, such as Glimpse's; the models are listed at once, never changed). An
+  older daemon rejects the field, so clients treat `invalid_request` as "not
+  available".
 
 ## Battery saver
 

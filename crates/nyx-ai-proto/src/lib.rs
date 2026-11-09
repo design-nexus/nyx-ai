@@ -184,6 +184,10 @@ pub enum Op {
         /// On battery, run models on the CPU only.
         #[serde(default)]
         battery_saver: Option<bool>,
+        /// Folders to list models from as well (an app's own model folder); folders
+        /// already listed are left as they are. Never deleted from or written to.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        add_model_dirs: Option<Vec<String>>,
     },
 }
 
@@ -1100,6 +1104,7 @@ mod tests {
                 model_updates: Some("notify".into()),
                 defaults: Some([("chat".to_string(), "org/m:Q4_K_M".to_string())].into()),
                 battery_saver: Some(true),
+                add_model_dirs: Some(vec!["~/models".into()]),
             },
             Op::CheckUpdates {},
         ];

@@ -510,8 +510,12 @@ impl Service {
             Op::ListCapabilities {} => Ok(Reply::Capabilities(self.capabilities())),
             Op::ServiceSettings {} => Ok(Reply::Service(self.service_settings())),
             Op::CheckUpdates {} => Ok(Reply::Models { models: self.check_updates().await }),
-            Op::ConfigureService { max_loaded, idle_unload_seconds, model_updates, defaults, battery_saver } => {
-                let settings = self.configure_service(max_loaded, idle_unload_seconds, model_updates, defaults, battery_saver).await?;
+            Op::ConfigureService { max_loaded, idle_unload_seconds, model_updates, defaults, battery_saver, add_model_dirs } => {
+                let rescan = add_model_dirs.is_some();
+                let settings = self.configure_service(max_loaded, idle_unload_seconds, model_updates, defaults, battery_saver, add_model_dirs).await?;
+                if rescan && let Err(e) = self.refresh(false).await {
+                    tracing::warn!(error = %e.message, "couldn't list the new model folders yet");
+                }
                 if battery_saver.is_some() {
                     self.apply_power().await;
                     return Ok(Reply::Service(self.service_settings()));
@@ -1173,8 +1177,17 @@ impl Service {
         updates: Option<String>,
         defaults: Option<BTreeMap<String, String>>,
         battery_saver: Option<bool>,
+        add_dirs: Option<Vec<String>>,
     ) -> Result<ServiceSettings, Error> {
         let invalid = |m: String| Error::new(ErrorKind::InvalidRequest, m);
+        for dir in add_dirs.iter().flatten() {
+            if !(dir.starts_with('/') || dir.starts_with("~/")) || dir.split('/').any(|part| part == "..") {
+                return Err(invalid(format!("{dir}: model folders are absolute paths or under ~/")));
+            }
+            if !crate::paths::expand(dir).is_dir() {
+                return Err(invalid(format!("{dir} isn't a folder")));
+            }
+        }
         if max_loaded.is_some_and(|n| !(1..=crate::config::MAX_LOADED_LIMIT).contains(&n)) {
             return Err(invalid(format!("max_loaded must be 1 to {}", crate::config::MAX_LOADED_LIMIT)));
         }
@@ -1221,6 +1234,13 @@ impl Service {
         }
         if let Some(n) = idle {
             settings.idle_unload_seconds = n;
+        }
+        for dir in add_dirs.into_iter().flatten() {
+            let listed = settings.model_dirs().contains(&crate::paths::expand(&dir));
+            if !listed {
+                tracing::info!(dir = %dir, "model folder added");
+                settings.model_dirs.push(dir);
+            }
         }
         settings.save(&self.shared.paths).map_err(|e| Error::new(ErrorKind::Internal, format!("couldn't save settings: {e}")))?;
         self.scheduler.set_limits(settings.max_loaded, settings.idle_unload_seconds);

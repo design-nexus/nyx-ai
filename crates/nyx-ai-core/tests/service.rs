@@ -273,6 +273,20 @@ async fn settings_pins_and_removal() {
     assert_eq!((service.max_loaded, service.idle_unload_seconds), (2, 300));
     assert!(h.client.configure_service(Some(99), None).await.is_err());
 
+    // An app's own model folder: listed at once, added once, left as it is.
+    let own = h._dir.path().join("app-models");
+    std::fs::create_dir_all(&own).unwrap();
+    std::fs::write(own.join("app-embed-Q8_0.gguf"), embed_file()).unwrap();
+    let dir = own.display().to_string();
+    let s = h.client.add_model_dirs(vec![dir.clone()]).await.unwrap();
+    assert!(s.model_dirs.contains(&dir));
+    assert!(h.client.list_models().await.unwrap().iter().any(|m| m.id == "app-embed-Q8_0" && !m.removable));
+    let again = h.client.add_model_dirs(vec![dir.clone()]).await.unwrap();
+    assert_eq!(again.model_dirs.iter().filter(|d| **d == dir).count(), 1);
+    for bad in ["relative/models", "/no/such/folder", "~/../etc"] {
+        assert_eq!(h.client.add_model_dirs(vec![bad.into()]).await.unwrap_err().kind, ErrorKind::InvalidRequest, "{bad}");
+    }
+
     let untrusted = Caller { name: "untrusted:x".into(), trusted: false, connection: 0 };
     let op = Op::RemoveModel { model: "org/chat:Q4_K_M".into() };
     assert_eq!(h.service.authorize(&untrusted, &op).unwrap_err().kind, ErrorKind::PermissionDenied);
@@ -319,6 +333,7 @@ async fn openai_endpoint_for_coding_tools() {
         model_updates: None,
         defaults: Some([(role.to_string(), model.to_string())].into()),
         battery_saver: None,
+        add_model_dirs: None,
     };
     let s = h.client.configure_service_with(set("coding", "org/chat:Q4_K_M")).await.unwrap();
     assert_eq!(s.defaults["coding"], "org/chat:Q4_K_M");
@@ -555,7 +570,7 @@ async fn battery_saver_moves_models_to_the_cpu_on_battery() {
     let power_dir = tempfile::tempdir().unwrap();
     power(power_dir.path(), true);
     let h = Harness::start_with("", None, Some(power_dir.path().to_path_buf())).await;
-    let saver = |on: bool| Op::ConfigureService { max_loaded: None, idle_unload_seconds: None, model_updates: None, defaults: None, battery_saver: Some(on) };
+    let saver = |on: bool| Op::ConfigureService { max_loaded: None, idle_unload_seconds: None, model_updates: None, defaults: None, battery_saver: Some(on), add_model_dirs: None };
     h.client.chat(ask("org/chat:Q4_K_M", "hi")).await.unwrap().collect_chat().await.unwrap();
 
     let s = h.client.configure_service_with(saver(true)).await.unwrap();

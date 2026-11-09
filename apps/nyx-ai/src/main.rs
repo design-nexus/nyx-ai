@@ -21,7 +21,7 @@ const USAGE: &str = "Usage: nyx-ai COMMAND [--json]
   load MODEL [--keep]          load now (--keep: until unload)
   unload MODEL                 unload unless something else uses it
   settings MODEL|* [KEY=VALUE…] show or change load-time settings (empty value removes)
-  service [max_loaded=N] [idle=SECONDS] [updates=auto|notify|off] [battery_saver=on|off]
+  service [max_loaded=N] [idle=SECONDS] [updates=auto|notify|off] [battery_saver=on|off] [add_dir=FOLDER]
                                show or change how many models stay loaded, for how long,
                                whether models update themselves, and whether they run on
                                the CPU on battery
@@ -250,16 +250,18 @@ async fn run(client: &Client, args: &[String], flags: Flags) -> nyx_ai_client::R
             let mut idle = None;
             let mut updates = None;
             let mut saver = None;
+            let mut dirs: Option<Vec<String>> = None;
             for kv in &args[1..] {
                 match kv.split_once('=') {
                     Some(("max_loaded", v)) => max = v.parse().ok(),
                     Some(("idle", v)) | Some(("idle_unload_seconds", v)) => idle = v.parse().ok(),
                     Some(("updates", v)) | Some(("model_updates", v)) => updates = Some(v.to_string()),
                     Some(("battery_saver", v)) => saver = Some(matches!(v, "on" | "true" | "yes" | "1")),
+                    Some(("add_dir", v)) | Some(("add_model_dir", v)) => dirs.get_or_insert_with(Vec::new).push(v.to_string()),
                     _ => {}
                 }
             }
-            let s = if max.is_none() && idle.is_none() && updates.is_none() && saver.is_none() {
+            let s = if max.is_none() && idle.is_none() && updates.is_none() && saver.is_none() && dirs.is_none() {
                 client.service_settings().await?
             } else {
                 client
@@ -269,6 +271,7 @@ async fn run(client: &Client, args: &[String], flags: Flags) -> nyx_ai_client::R
                         model_updates: updates,
                         defaults: None,
                         battery_saver: saver,
+                        add_model_dirs: dirs,
                     })
                     .await?
             };
@@ -304,6 +307,7 @@ async fn run(client: &Client, args: &[String], flags: Flags) -> nyx_ai_client::R
                             model_updates: None,
                             defaults: Some([(role.clone(), model.clone())].into()),
                             battery_saver: None,
+                            add_model_dirs: None,
                         })
                         .await?
                 }

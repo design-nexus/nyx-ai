@@ -22,8 +22,8 @@ about 0.58 with the text and the audio.
 
 ## Model
 
-Either keep Glimpse's folder and add it to AI Core's `model_dirs`
-(`~/.config/nyx-ai/settings.toml`; folder models are read-only and never
+Either keep Glimpse's folder and add it to AI Core's `model_dirs` (Glimpse does
+this itself with `add_model_dirs`; folder models are read-only and never
 deleted), or download into the shared cache:
 
 ```sh
