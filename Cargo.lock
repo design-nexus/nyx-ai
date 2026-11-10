@@ -922,7 +922,7 @@ dependencies = [
 [[package]]
 name = "nyx-actions"
 version = "0.1.0"
-source = "git+https://github.com/design-nexus/nyx-core.git?rev=f6fd2e5caba211eabdacf619c33160d7c03bb4ce#f6fd2e5caba211eabdacf619c33160d7c03bb4ce"
+source = "git+https://github.com/design-nexus/nyx-core.git?rev=47c5e0f328b4042df4c08fc317510644a64d1124#47c5e0f328b4042df4c08fc317510644a64d1124"
 dependencies = [
  "futures-util",
  "jsonschema",
@@ -1005,7 +1005,7 @@ dependencies = [
 [[package]]
 name = "nyx-peer"
 version = "0.1.0"
-source = "git+https://github.com/design-nexus/nyx-core.git?rev=f6fd2e5caba211eabdacf619c33160d7c03bb4ce#f6fd2e5caba211eabdacf619c33160d7c03bb4ce"
+source = "git+https://github.com/design-nexus/nyx-core.git?rev=47c5e0f328b4042df4c08fc317510644a64d1124#47c5e0f328b4042df4c08fc317510644a64d1124"
 
 [[package]]
 name = "once_cell"

@@ -14,8 +14,8 @@ doc = false
 
 [dependencies]
 nyx-ai-proto.workspace = true
-nyx-peer = { git = "https://github.com/design-nexus/nyx-core.git", rev = "f6fd2e5caba211eabdacf619c33160d7c03bb4ce" }
-nyx-actions = { git = "https://github.com/design-nexus/nyx-core.git", rev = "f6fd2e5caba211eabdacf619c33160d7c03bb4ce" }
+nyx-peer = { git = "https://github.com/design-nexus/nyx-core.git", rev = "47c5e0f328b4042df4c08fc317510644a64d1124" }
+nyx-actions = { git = "https://github.com/design-nexus/nyx-core.git", rev = "47c5e0f328b4042df4c08fc317510644a64d1124" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
