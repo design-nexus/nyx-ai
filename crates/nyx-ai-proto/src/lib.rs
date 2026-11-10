@@ -146,8 +146,13 @@ pub enum Op {
     ServiceSettings {},
     /// Check Hugging Face for newer revisions of cached models now.
     CheckUpdates {},
-    /// Actions apps offer (their D-Bus control interfaces and registered providers).
-    ListActions {},
+    /// Actions apps offer (installed and running Nyx apps, and registered providers).
+    /// `detail`: also the apps as nyx-actions describes them (`apps` in the reply).
+    /// Servers before it refuse the field; ask without it then.
+    ListActions {
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        detail: bool,
+    },
     /// Run an action. `confirmed`: the person agreed to it in the caller's UI, for
     /// actions that ask first.
     InvokeAction {
@@ -241,7 +246,7 @@ impl Op {
             Op::ListCapabilities {} => "list_capabilities",
             Op::ServiceSettings {} => "service_settings",
             Op::CheckUpdates {} => "check_updates",
-            Op::ListActions {} => "list_actions",
+            Op::ListActions { .. } => "list_actions",
             Op::InvokeAction { .. } => "invoke_action",
             Op::ServeActions { .. } => "serve_actions",
             Op::ActionResult { .. } => "action_result",
@@ -676,7 +681,13 @@ pub enum Reply {
     Worker(WorkerStatus),
     Capabilities(Capabilities),
     Service(ServiceSettings),
-    Actions { actions: Vec<ActionInfo> },
+    Actions {
+        actions: Vec<ActionInfo>,
+        /// With `list_actions`' `detail`: nyx-actions catalog entries (app, running API,
+        /// actions with risk, aliases, positional arguments…).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        apps: Option<Vec<Value>>,
+    },
     /// What an action returned.
     ActionDone { result: Value },
 }
@@ -1128,6 +1139,15 @@ mod tests {
         assert_eq!(e.kind, ErrorKind::UnsupportedOperation);
         let (_, e) = decode_client_line(r#"{"hello":{"api_version":1,"client":"x","debug":true}}"#).unwrap_err();
         assert_eq!(e.kind, ErrorKind::InvalidRequest);
+    }
+
+    #[test]
+    fn action_details_are_asked_for() {
+        assert_eq!(serde_json::to_value(Op::ListActions { detail: false }).unwrap(), json!({"type": "list_actions"}));
+        let ClientLine::Request(r) = decode_client_line(&request(json!({"type": "list_actions", "detail": true}))).unwrap() else { panic!() };
+        assert_eq!(r.op, Op::ListActions { detail: true });
+        let reply = serde_json::to_value(Reply::Actions { actions: vec![], apps: None }).unwrap();
+        assert_eq!(reply, json!({"type": "actions", "actions": []}));
     }
 
     #[test]

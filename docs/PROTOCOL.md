@@ -162,20 +162,22 @@ request loads it with the new settings); `pending_settings` shows that.
 The shared action registry: what apps can do for an assistant (or any caller).
 Actions come from two places:
 
-- Running Nyx apps' D-Bus control interfaces
-  (`io.github.design_nexus.nyx.Control` at the GApplication object path, with
-  `Describe() -> s` and `Call(s name, s arguments) -> s`). AI Core asks every
-  `io.github.design_nexus.nyx.*` name on the session bus, at most every 10 s.
-  `Describe` returns MCP-style tools: `name`, `description`, `inputSchema`, and
-  optional `outputSchema` and `annotations` (`readOnlyHint`, `destructiveHint`,
-  `openWorldHint`). A tool without `readOnlyHint: true` asks first.
+- Nyx apps, through nyx-actions (nyx-core `crates/nyx-actions`, contract in its
+  `docs/CONTRACT.md`), the registry the `nyx` command and Glimpse link too:
+  installed apps' manifests (`nyx/actions/<app-id>.json` in the XDG data folders)
+  and running apps' D-Bus control interfaces (`io.github.design_nexus.nyx.Control`
+  at the GApplication object path; `Describe`, API 1's `Call`, API 2's `Invoke`),
+  asked at most every 10 s. An installed app that isn't running is started by
+  D-Bus for the call (`activation: dbus` in its manifest) or listed as unavailable
+  until it is opened. An API 1 tool without annotations asks first.
 - Providers connected to AI Core: `serve_actions` offers specs for as long as
   the request stays open. Each call arrives as an `invoke` event (`invocation`,
   `action`, `arguments`, `caller`), answered on the same connection with
   `action_result`. Closing the request or the connection withdraws the actions
   and fails calls in flight with `unavailable`. Only trusted programs may serve.
 
-A spec (and an `actions` entry, which adds `owner`, `source` (`dbus` or
+A spec (and an `actions` entry, which adds `owner` (the app's ID, or the serving
+program), `source` (`dbus` for a running app, `manifest` for an installed one,
 `connection`) and `available`):
 
 ```json
@@ -190,14 +192,21 @@ A spec (and an `actions` entry, which adds `owner`, `source` (`dbus` or
 - `confirmation` is `ask` (default) or `never`; `side_effects` is `read_only`,
   `writes`, `external`, `destructive` or `unknown` (default, treated as `writes`).
 - `timeout_ms` defaults to 30 s, at most 300 s.
+- An app's `privileged` actions read as `destructive` here. `list_actions` with
+  `"detail": true` adds `apps`: nyx-actions catalog entries (the app's name,
+  namespaces, aliases, the API it runs, and each action's `risk`, `title`,
+  `aliases`, `positional` arguments, `state` and `reason`). An older AI Core refuses
+  the field; `nyx-ai-client`'s `list_actions_detail` falls back.
 
 `invoke_action` checks, in order: the action exists (`unknown_action`) and is
 available (`unavailable`); an untrusted caller may run only `read_only` actions
 (`permission_denied`); an action that asks first needs `confirmed: true`
 (`confirmation_required`), which the caller sends only after the person agreed in
 its own UI; the arguments match `input_schema` (`invalid_request`, naming the
-place). Then it routes the call. The owning app checks its own permissions and
-may refuse: its message comes back as `action_failed`. AI Core logs the action,
+place). Then it routes the call, naming the caller to the app (`on_behalf_of`).
+The owning app checks again (its control helper applies the same rules to AI
+Core's call) and its own permissions, and may refuse: its message comes back as
+`action_failed`, or `permission_denied` when it says so. AI Core logs the action,
 caller, owner, outcome and duration, never the arguments or result.
 
 ## OpenAI-compatible endpoint
@@ -225,6 +234,8 @@ shape (`{"error": {"code", "message", "type"}}`).
 - Version 1, additions: actions (`list_actions`, `invoke_action`,
   `serve_actions`, `action_result`, the `invoke` event, and the errors
   `unknown_action`, `confirmation_required` and `action_failed`).
+- Version 1, additions: `list_actions`' `detail` and the reply's `apps`; installed
+  apps' actions (`source: manifest`), started for the call.
 - Version 1, additions: image and audio `embed` inputs; `ModelIdentity.projector`
   and `settings`; the settings keys `pooling`, `batch-size`, `ubatch-size`,
   `image-min-tokens` and `image-max-tokens`.

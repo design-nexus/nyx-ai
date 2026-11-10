@@ -920,6 +920,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "nyx-actions"
+version = "0.1.0"
+source = "git+https://github.com/design-nexus/nyx-core.git?rev=f6fd2e5caba211eabdacf619c33160d7c03bb4ce#f6fd2e5caba211eabdacf619c33160d7c03bb4ce"
+dependencies = [
+ "futures-util",
+ "jsonschema",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "zbus",
+]
+
+[[package]]
 name = "nyx-ai"
 version = "0.1.0"
 dependencies = [
@@ -954,6 +968,7 @@ dependencies = [
  "hyper-util",
  "jsonschema",
  "libc",
+ "nyx-actions",
  "nyx-ai-client",
  "nyx-ai-proto",
  "nyx-peer",
@@ -966,7 +981,6 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
- "zbus",
 ]
 
 [[package]]
@@ -991,7 +1005,7 @@ dependencies = [
 [[package]]
 name = "nyx-peer"
 version = "0.1.0"
-source = "git+https://github.com/design-nexus/nyx-core.git?rev=a801c59bf6868d45f4120a7b4974f1c47e5fe7a1#a801c59bf6868d45f4120a7b4974f1c47e5fe7a1"
+source = "git+https://github.com/design-nexus/nyx-core.git?rev=f6fd2e5caba211eabdacf619c33160d7c03bb4ce#f6fd2e5caba211eabdacf619c33160d7c03bb4ce"
 
 [[package]]
 name = "once_cell"

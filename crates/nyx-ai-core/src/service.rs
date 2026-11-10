@@ -522,7 +522,10 @@ impl Service {
                 }
                 Ok(Reply::Service(settings))
             }
-            Op::ListActions {} => Ok(Reply::Actions { actions: self.actions.list().await }),
+            Op::ListActions { detail } => {
+                let (actions, apps) = self.actions.list(detail).await;
+                Ok(Reply::Actions { actions, apps })
+            }
             Op::InvokeAction { action, arguments, confirmed } => self
                 .actions
                 .invoke(caller, &action, arguments, confirmed, self.options.allow_untrusted, &cancel)

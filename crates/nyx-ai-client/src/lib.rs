@@ -265,9 +265,20 @@ impl Client {
 
     /// The actions apps offer.
     pub async fn list_actions(&self) -> Result<Vec<ActionInfo>> {
-        match self.call(Op::ListActions {}).await? {
-            Reply::Actions { actions } => Ok(actions),
+        match self.call(Op::ListActions { detail: false }).await? {
+            Reply::Actions { actions, .. } => Ok(actions),
             other => Err(unexpected(&other)),
+        }
+    }
+
+    /// The actions and the apps offering them as nyx-actions describes them (catalog
+    /// entries). An AI Core from before the details gives the actions alone.
+    pub async fn list_actions_detail(&self) -> Result<(Vec<ActionInfo>, Vec<Value>)> {
+        match self.call(Op::ListActions { detail: true }).await {
+            Ok(Reply::Actions { actions, apps }) => Ok((actions, apps.unwrap_or_default())),
+            Ok(other) => Err(unexpected(&other)),
+            Err(e) if e.kind == ErrorKind::InvalidRequest => Ok((self.list_actions().await?, Vec::new())),
+            Err(e) => Err(e),
         }
     }
 
