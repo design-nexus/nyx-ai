@@ -1,6 +1,9 @@
 //! An OpenAI-compatible endpoint for coding tools, on loopback. Requests go
 //! through the scheduler like any app's (loading the model, waiting their turn)
 //! and on to the worker unchanged; the worker itself stays private.
+//!
+//! Requests need the API key (`Authorization: Bearer KEY`) and a loopback `Host`,
+//! and POSTs need a JSON body, so web pages can't reach it through the browser.
 
 use crate::service::Service;
 use bytes::Bytes;
@@ -39,7 +42,44 @@ fn error_reply(e: &Error) -> Response<Body> {
     json_reply(status, &json!({"error": {"code": status.as_u16(), "message": e.message, "type": kind}}))
 }
 
+fn refusal(status: StatusCode, message: &str) -> Response<Body> {
+    let kind = if status == StatusCode::UNAUTHORIZED { "authentication_error" } else { "invalid_request_error" };
+    json_reply(status, &json!({"error": {"code": status.as_u16(), "message": message, "type": kind}}))
+}
+
+/// Why `req` is refused before it's read: a `Host` that isn't loopback (DNS
+/// rebinding), a missing or wrong key, or a POST that isn't JSON.
+fn refuse(service: &Service, req: &Request<Incoming>) -> Option<Response<Body>> {
+    let header = |name: hyper::header::HeaderName| req.headers().get(name).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let host = header(hyper::header::HOST);
+    let name = match host.rsplit_once(':') {
+        Some((name, port)) if !name.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => host,
+    };
+    if !matches!(name, "127.0.0.1" | "localhost" | "[::1]") {
+        return Some(refusal(StatusCode::FORBIDDEN, "only local coding tools can use this endpoint"));
+    }
+    if req.uri().path() == "/health" {
+        return None;
+    }
+    let sent = header(hyper::header::AUTHORIZATION).strip_prefix("Bearer ").unwrap_or("").trim();
+    let Some(key) = service.openai_key() else {
+        return Some(refusal(StatusCode::UNAUTHORIZED, "the endpoint has no API key yet"));
+    };
+    let same = sent.len() == key.len() && sent.bytes().zip(key.bytes()).fold(0u8, |d, (a, b)| d | (a ^ b)) == 0;
+    if !same {
+        return Some(refusal(StatusCode::UNAUTHORIZED, "send the API key from ~/.config/nyx-ai/api-key as a Bearer token"));
+    }
+    if req.method() == hyper::Method::POST && !header(hyper::header::CONTENT_TYPE).starts_with("application/json") {
+        return Some(refusal(StatusCode::UNSUPPORTED_MEDIA_TYPE, "the request body must be JSON (Content-Type: application/json)"));
+    }
+    None
+}
+
 async fn handle(service: Arc<Service>, req: Request<Incoming>, stop: CancellationToken) -> Result<Response<Body>, Infallible> {
+    if let Some(refused) = refuse(&service, &req) {
+        return Ok(refused);
+    }
     let method = req.method().clone();
     let path = req.uri().path_and_query().map(|p| p.as_str().to_string()).unwrap_or_default();
     let bare = req.uri().path().to_string();

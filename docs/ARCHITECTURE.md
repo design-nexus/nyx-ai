@@ -52,13 +52,21 @@ flowchart LR
 
 ## OpenAI-compatible endpoint
 
-For coding tools, `nyx-aid` also listens on `openai_endpoint` (default
-`127.0.0.1:8080`, loopback only; `nyx-aid.socket` holds it so the first request
-starts the daemon). It answers `GET /v1/models` itself and passes `POST /v1/*`
+For coding tools, `nyx-aid` can also listen on `127.0.0.1:8080` (loopback only).
+It's off until a user turns it on (`nyx-ai service openai=on` or Settings › AI),
+which saves `openai_listen` in settings.toml, makes an API key in
+`~/.config/nyx-ai/api-key` (0600) and enables `nyx-aid-openai.socket`, so later
+sessions start the daemon on the first request. That socket is separate from the
+apps' `nyx-aid.socket`, so a taken port can't stop the apps reaching AI Core.
+Turning it off closes the port at once and disables the socket.
+
+Every request needs `Authorization: Bearer KEY` and a `Host` of `127.0.0.1`,
+`localhost` or `[::1]` (so a web page can't reach it by DNS rebinding), and POSTs
+need `Content-Type: application/json` (so a page can't send a simple form
+request); `GET /health` needs only the Host. It answers `GET /v1/models` itself and passes `POST /v1/*`
 bodies to the worker unchanged, after taking a lease on the named model through
 the scheduler (so the model loads on demand, waits its turn, and is never
-unloaded mid-reply). Closing the connection cancels the request. Like the old
-`llama-server` on that port it has no key: any local program can use it.
+unloaded mid-reply). Closing the connection cancels the request.
 
 ## Crates
 

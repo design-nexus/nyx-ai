@@ -193,6 +193,9 @@ pub enum Op {
         /// already listed are left as they are. Never deleted from or written to.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         add_model_dirs: Option<Vec<String>>,
+        /// The OpenAI-compatible endpoint for coding tools on (with an API key) or off.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        openai: Option<bool>,
     },
 }
 
@@ -1000,6 +1003,9 @@ pub struct ServiceSettings {
     /// The OpenAI-compatible endpoint for coding tools, when it's on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub openai_endpoint: Option<String>,
+    /// The file with the endpoint's API key (`Authorization: Bearer KEY`), when it's on.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub openai_key_file: Option<String>,
     /// `auto`, `notify` or `off`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_updates: Option<String>,
@@ -1116,6 +1122,7 @@ mod tests {
                 defaults: Some([("chat".to_string(), "org/m:Q4_K_M".to_string())].into()),
                 battery_saver: Some(true),
                 add_model_dirs: Some(vec!["~/models".into()]),
+                openai: Some(true),
             },
             Op::CheckUpdates {},
         ];

@@ -100,6 +100,7 @@ impl Harness {
             power_supply: power,
             hf_endpoint: hub,
             update_idle_secs: Some(0),
+            socket_units: false,
         };
         let listener = nyx_ai_core::server::listen(&paths.socket).unwrap().unix;
         let service = Service::new(paths.clone(), options);
@@ -352,7 +353,27 @@ async fn openai_endpoint_for_coding_tools() {
     tcp.set_nonblocking(true).unwrap();
     let base = format!("http://{}", tcp.local_addr().unwrap());
     tokio::spawn(nyx_ai_core::openai::serve(h.service.clone(), tcp, h.stop.clone()));
-    let http = reqwest::Client::new();
+
+    // Without the key, from a web page's Host, or with a form body: refused.
+    let plain = reqwest::Client::new();
+    assert_eq!(plain.get(format!("{base}/v1/models")).send().await.unwrap().status(), 401, "no key yet");
+    let key = h.service.ensure_openai_key().unwrap();
+    assert_eq!(h.service.ensure_openai_key().unwrap(), key, "the key stays the same");
+    let file = h.paths.config.join("api-key");
+    assert_eq!(std::fs::read_to_string(&file).unwrap().trim(), key);
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
+    assert_eq!(plain.get(format!("{base}/v1/models")).send().await.unwrap().status(), 401);
+    let wrong = plain.get(format!("{base}/v1/models")).bearer_auth("nyx-0000").send().await.unwrap();
+    assert_eq!(wrong.status(), 401);
+    let rebound = plain.get(format!("{base}/v1/models")).bearer_auth(&key).header("host", "evil.example:8080").send().await.unwrap();
+    assert_eq!(rebound.status(), 403);
+    let form = plain.post(format!("{base}/v1/chat/completions")).bearer_auth(&key).header("content-type", "text/plain").body("{}").send().await.unwrap();
+    assert_eq!(form.status(), 415);
+    assert_eq!(plain.get(format!("{base}/health")).send().await.unwrap().status(), 200);
+
+    let auth = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")).unwrap();
+    let http = reqwest::Client::builder().default_headers([(reqwest::header::AUTHORIZATION, auth)].into_iter().collect()).build().unwrap();
 
     let models: serde_json::Value = http.get(format!("{base}/v1/models")).send().await.unwrap().json().await.unwrap();
     let ids: Vec<&str> = models["data"].as_array().unwrap().iter().filter_map(|m| m["id"].as_str()).collect();
@@ -385,6 +406,7 @@ async fn openai_endpoint_for_coding_tools() {
         defaults: Some([(role.to_string(), model.to_string())].into()),
         battery_saver: None,
         add_model_dirs: None,
+        openai: None,
     };
     let s = h.client.configure_service_with(set("coding", "org/chat:Q4_K_M")).await.unwrap();
     assert_eq!(s.defaults["coding"], "org/chat:Q4_K_M");
@@ -407,6 +429,33 @@ async fn openai_endpoint_for_coding_tools() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(idle, "a dropped request kept its slot");
+    h.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn openai_endpoint_is_off_until_turned_on() {
+    let h = Harness::start().await;
+    let s = h.client.service_settings().await.unwrap();
+    assert!(s.openai_endpoint.is_none() && s.openai_key_file.is_none(), "{s:?}");
+    let set = |on: bool| Op::ConfigureService {
+        max_loaded: None,
+        idle_unload_seconds: None,
+        model_updates: None,
+        defaults: None,
+        battery_saver: None,
+        add_model_dirs: None,
+        openai: Some(on),
+    };
+    let s = h.client.configure_service_with(set(true)).await.unwrap();
+    assert_eq!(s.openai_endpoint.as_deref(), Some("127.0.0.1:8080"));
+    let file = s.openai_key_file.expect("key file");
+    assert!(std::fs::read_to_string(&file).unwrap().trim().starts_with("nyx-"));
+    assert!(std::fs::read_to_string(h.paths.config.join("settings.toml")).unwrap().contains("openai_listen = \"127.0.0.1:8080\""));
+    let s = h.client.configure_service_with(set(false)).await.unwrap();
+    assert!(s.openai_endpoint.is_none() && s.openai_key_file.is_none());
+
+    let untrusted = Caller { name: "untrusted:x".into(), trusted: false, connection: 0 };
+    assert_eq!(h.service.authorize(&untrusted, &set(true)).unwrap_err().kind, ErrorKind::PermissionDenied);
     h.stop().await;
 }
 
@@ -621,7 +670,7 @@ async fn battery_saver_moves_models_to_the_cpu_on_battery() {
     let power_dir = tempfile::tempdir().unwrap();
     power(power_dir.path(), true);
     let h = Harness::start_with("", None, Some(power_dir.path().to_path_buf())).await;
-    let saver = |on: bool| Op::ConfigureService { max_loaded: None, idle_unload_seconds: None, model_updates: None, defaults: None, battery_saver: Some(on), add_model_dirs: None };
+    let saver = |on: bool| Op::ConfigureService { max_loaded: None, idle_unload_seconds: None, model_updates: None, defaults: None, battery_saver: Some(on), add_model_dirs: None, openai: None };
     h.client.chat(ask("org/chat:Q4_K_M", "hi")).await.unwrap().collect_chat().await.unwrap();
 
     let s = h.client.configure_service_with(saver(true)).await.unwrap();

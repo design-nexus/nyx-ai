@@ -1,8 +1,8 @@
 //! `nyx-aid`: Nyx AI Core's daemon. Started by `nyx-aid.socket` the first time
 //! a client connects, or directly.
 //!
-//! It also serves an OpenAI-compatible API for coding tools at
-//! `openai_endpoint` in settings.toml (127.0.0.1:8080 unless turned off).
+//! It also serves an OpenAI-compatible API for coding tools at `openai_endpoint` in
+//! settings.toml once it's turned on (`nyx-ai service openai=on`), with an API key.
 //!
 //! `NYX_AI_SOCKET` moves the socket (test copies), `NYX_AI_WORKER` uses another
 //! llama-server, and `NYX_AI_ALLOW_UNTRUSTED=1` lets programs outside the trusted
@@ -33,6 +33,7 @@ fn main() -> ExitCode {
         power_supply: std::env::var_os("NYX_AI_POWER_SUPPLY").filter(|v| !v.is_empty()).map(Into::into),
         hf_endpoint: None,
         update_idle_secs: None,
+        socket_units: std::env::var_os("NYX_AI_SOCKET").is_none(),
     };
     let listeners = match server::listen(&paths.socket) {
         Ok(listeners) => listeners,
@@ -53,17 +54,7 @@ fn main() -> ExitCode {
         let stop = CancellationToken::new();
         service.run_background(stop.clone());
         let server = tokio::spawn(server::serve(service.clone(), listeners.unix, stop.clone()));
-        let openai = match (service.openai_addr(), listeners.tcp) {
-            (Some(_), Some(tcp)) => Some(tcp),
-            (Some(addr), None) => std::net::TcpListener::bind(addr)
-                .and_then(|l| l.set_nonblocking(true).map(|_| l))
-                .map_err(|e| tracing::warn!(%addr, error = %e, "the OpenAI-compatible endpoint can't listen"))
-                .ok(),
-            (None, _) => None,
-        };
-        if let Some(tcp) = openai {
-            tokio::spawn(nyx_ai_core::openai::serve(service.clone(), tcp, stop.clone()));
-        }
+        service.start_openai(&stop, listeners.tcp);
         tracing::info!(socket = %service.paths().socket.display(), "Nyx AI Core ready");
         let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
             tracing::error!("can't watch signals");

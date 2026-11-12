@@ -102,4 +102,4 @@ Chat no longer runs its own llama.cpp. Its installer removed
 `nyx-llama-server.service` and `~/.local/lib/nyx-chat/llama.cpp`. Rolling Chat
 back to a version from before the migration brings its own runner back with its
 own installer; it and AI Core would then both use port 8080, so turn one off
-(`systemctl --user disable --now nyx-aid.socket` or Chat's server).
+(`nyx-ai service openai=off` or Chat's server).

@@ -106,6 +106,11 @@ impl Paths {
         self.runtime.join("worker.sock")
     }
 
+    /// The OpenAI-compatible endpoint's API key (0600), for coding tools to send.
+    pub fn api_key(&self) -> PathBuf {
+        self.config.join("api-key")
+    }
+
     pub fn worker_key(&self) -> PathBuf {
         self.runtime.join("worker.key")
     }

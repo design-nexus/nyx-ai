@@ -19,8 +19,11 @@ pub struct Settings {
     /// A llama-server to use instead of the installed build.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker: Option<String>,
-    /// Where coding tools reach the OpenAI-compatible API (loopback only); empty
-    /// turns it off. `nyx-aid.socket` listens on the same address.
+    /// Where coding tools reach the OpenAI-compatible API (loopback only); empty,
+    /// the default, keeps it off. `nyx-aid-openai.socket` listens on the same address.
+    /// Saved as `openai_listen`: the old `openai_endpoint` key held the address
+    /// whether or not anyone turned it on, so it's ignored.
+    #[serde(rename = "openai_listen")]
     pub openai_endpoint: String,
     /// `auto` downloads newer revisions of cached models while idle on AC power,
     /// `notify` only reports them, `off` doesn't check.
@@ -34,6 +37,9 @@ pub struct Settings {
     pub battery_saver: bool,
 }
 
+/// Where the OpenAI-compatible endpoint listens once it's turned on.
+pub const OPENAI_ENDPOINT: &str = "127.0.0.1:8080";
+
 impl Default for Settings {
     fn default() -> Self {
         Settings {
@@ -41,7 +47,8 @@ impl Default for Settings {
             idle_unload_seconds: 900,
             model_dirs: vec!["~/.local/share/nyx-ai/models".into(), "~/.local/share/nyx-assistant/models".into()],
             worker: None,
-            openai_endpoint: "127.0.0.1:8080".into(),
+            // Off until someone turns it on for coding tools (nyx-ai service openai=on).
+            openai_endpoint: String::new(),
             model_updates: "auto".into(),
             update_check_hours: 24,
             sidecars: vec!["mmproj".into(), "mtp".into()],
@@ -141,11 +148,21 @@ mod tests {
     #[test]
     fn openai_endpoint_stays_on_loopback() {
         let mut s = Settings::default();
+        assert!(s.openai_addr().is_none(), "off by default");
+        s.openai_endpoint = OPENAI_ENDPOINT.into();
         assert_eq!(s.openai_addr().unwrap().to_string(), "127.0.0.1:8080");
         s.openai_endpoint = "0.0.0.0:8080".into();
         assert!(s.openai_addr().is_none());
         s.openai_endpoint = String::new();
         assert!(s.openai_addr().is_none());
+    }
+
+    #[test]
+    fn old_endpoint_setting_is_ignored() {
+        let s: Settings = toml::from_str("openai_endpoint = \"127.0.0.1:8080\"\n").unwrap();
+        assert!(s.openai_addr().is_none());
+        let s: Settings = toml::from_str("openai_listen = \"127.0.0.1:8080\"\n").unwrap();
+        assert!(s.openai_addr().is_some());
     }
 
     #[test]

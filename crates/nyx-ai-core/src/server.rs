@@ -41,6 +41,9 @@ pub fn listen(path: &Path) -> std::io::Result<Listeners> {
         use std::os::fd::FromRawFd;
         let (mut unix, mut tcp) = (None, None);
         for fd in 3..3 + count {
+            // systemd passes them inheritable; the worker must not keep the port open.
+            // SAFETY: fcntl on an fd number only changes that descriptor's flags.
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
             // SAFETY: a zeroed sockaddr_storage is valid, and getsockname fills it for the fd systemd passed.
             let family = unsafe {
                 let mut addr: libc::sockaddr_storage = std::mem::zeroed();

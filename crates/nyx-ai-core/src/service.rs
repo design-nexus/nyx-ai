@@ -50,6 +50,9 @@ pub struct Options {
     pub hf_endpoint: Option<String>,
     /// How long a model must sit unused before an update switches it (120 s).
     pub update_idle_secs: Option<u64>,
+    /// Enable and disable `nyx-aid-openai.socket` with the endpoint (the session's
+    /// daemon, not test copies).
+    pub socket_units: bool,
 }
 
 #[derive(Default)]
@@ -189,6 +192,12 @@ pub struct Service {
     actions: Actions,
     /// Models loaded before the last CPU-only switch, unloaded once idle.
     power_stale: Mutex<BTreeSet<String>>,
+    /// The daemon's stop token, and the running OpenAI-compatible endpoint's.
+    stops: Mutex<(Option<CancellationToken>, Option<CancellationToken>)>,
+    /// The endpoint's API key, once it has one.
+    openai_key: Mutex<Option<String>>,
+    /// Itself, for starting the endpoint from a request.
+    me: Weak<Service>,
 }
 
 const PRIVILEGED: &[&str] = &["remove_model", "configure_model", "configure_service", "serve_actions"];
@@ -258,6 +267,9 @@ impl Service {
                 started: Instant::now(),
                 actions: Actions::default(),
                 power_stale: Mutex::default(),
+                stops: Mutex::new((None, None)),
+                openai_key: Mutex::new(None),
+                me: me.clone(),
             }
         })
     }
@@ -510,9 +522,13 @@ impl Service {
             Op::ListCapabilities {} => Ok(Reply::Capabilities(self.capabilities())),
             Op::ServiceSettings {} => Ok(Reply::Service(self.service_settings())),
             Op::CheckUpdates {} => Ok(Reply::Models { models: self.check_updates().await }),
-            Op::ConfigureService { max_loaded, idle_unload_seconds, model_updates, defaults, battery_saver, add_model_dirs } => {
+            Op::ConfigureService { max_loaded, idle_unload_seconds, model_updates, defaults, battery_saver, add_model_dirs, openai } => {
                 let rescan = add_model_dirs.is_some();
                 let settings = self.configure_service(max_loaded, idle_unload_seconds, model_updates, defaults, battery_saver, add_model_dirs).await?;
+                let settings = match openai {
+                    Some(on) => self.set_openai(on)?,
+                    None => settings,
+                };
                 if rescan && let Err(e) = self.refresh(false).await {
                     tracing::warn!(error = %e.message, "couldn't list the new model folders yet");
                 }
@@ -1128,11 +1144,13 @@ impl Service {
 
     fn service_settings(&self) -> ServiceSettings {
         let s = self.settings.lock().expect("settings");
+        let on = s.openai_addr().is_some();
         ServiceSettings {
             max_loaded: s.max_loaded,
             idle_unload_seconds: s.idle_unload_seconds,
             model_dirs: s.model_dirs.clone(),
             openai_endpoint: s.openai_addr().map(|a| a.to_string()),
+            openai_key_file: on.then(|| self.shared.paths.api_key().display().to_string()),
             model_updates: Some(s.model_updates.clone()),
             defaults: s.defaults.clone(),
             battery_saver: s.battery_saver,
@@ -1171,6 +1189,100 @@ impl Service {
                 self.power_stale.lock().expect("power").remove(&id);
             }
         }
+    }
+
+    /// The OpenAI-compatible endpoint's API key: read from its file, made the first time.
+    pub fn ensure_openai_key(&self) -> std::io::Result<String> {
+        let mut cached = self.openai_key.lock().expect("key");
+        if let Some(key) = cached.as_ref() {
+            return Ok(key.clone());
+        }
+        let file = self.shared.paths.api_key();
+        let key = match std::fs::read_to_string(&file) {
+            Ok(text) if !text.trim().is_empty() => text.trim().to_string(),
+            _ => {
+                use std::io::{Read, Write};
+                use std::os::unix::fs::OpenOptionsExt;
+                let mut bytes = [0u8; 24];
+                std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+                let key: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+                let key = format!("nyx-{key}");
+                if let Some(dir) = file.parent() {
+                    std::fs::create_dir_all(dir)?;
+                }
+                let tmp = file.with_extension("tmp");
+                let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&tmp)?;
+                writeln!(f, "{key}")?;
+                std::fs::rename(&tmp, &file)?;
+                key
+            }
+        };
+        *cached = Some(key.clone());
+        Ok(key)
+    }
+
+    /// The endpoint's key, if it has one already (requests without it are refused).
+    pub fn openai_key(&self) -> Option<String> {
+        self.openai_key.lock().expect("key").clone()
+    }
+
+    /// Serve the OpenAI-compatible endpoint when the settings say it's on: on
+    /// `listener` (systemd's socket) or a socket of its own. `stop` is the daemon's.
+    pub fn start_openai(self: &Arc<Self>, stop: &CancellationToken, listener: Option<std::net::TcpListener>) {
+        let mut stops = self.stops.lock().expect("stops");
+        stops.0 = Some(stop.clone());
+        let Some(addr) = self.settings.lock().expect("settings").openai_addr() else { return };
+        if stops.1.is_some() {
+            return;
+        }
+        if let Err(e) = self.ensure_openai_key() {
+            tracing::warn!(error = %e, "the OpenAI-compatible endpoint has no API key, so it stays off");
+            return;
+        }
+        let listener = match listener {
+            Some(l) => Some(l),
+            None => std::net::TcpListener::bind(addr)
+                .and_then(|l| l.set_nonblocking(true).map(|_| l))
+                .map_err(|e| tracing::warn!(%addr, error = %e, "the OpenAI-compatible endpoint can't listen"))
+                .ok(),
+        };
+        let Some(listener) = listener else { return };
+        let token = stop.child_token();
+        stops.1 = Some(token.clone());
+        tokio::spawn(crate::openai::serve(self.clone(), listener, token));
+    }
+
+    /// Turn the endpoint on (with a key, and its socket unit for the next session) or off
+    /// (closing the port now).
+    fn set_openai(&self, on: bool) -> Result<ServiceSettings, Error> {
+        let internal = |m: String| Error::new(ErrorKind::Internal, m);
+        {
+            let mut settings = self.settings.lock().expect("settings");
+            settings.openai_endpoint = if on { crate::config::OPENAI_ENDPOINT.into() } else { String::new() };
+            settings.save(&self.shared.paths).map_err(|e| internal(format!("couldn't save settings: {e}")))?;
+        }
+        let unit = "nyx-aid-openai.socket";
+        if on {
+            self.ensure_openai_key().map_err(|e| internal(format!("couldn't make the API key: {e}")))?;
+            // Enabled, not started: the daemon listens itself now, and the socket unit
+            // starts it on the first request in later sessions.
+            if self.options.socket_units {
+                systemctl(&["enable", unit]);
+            }
+            let stop = self.stops.lock().expect("stops").0.clone();
+            if let (Some(stop), Some(me)) = (stop, self.me.upgrade()) {
+                me.start_openai(&stop, None);
+            }
+        } else {
+            if let Some(token) = self.stops.lock().expect("stops").1.take() {
+                token.cancel();
+            }
+            if self.options.socket_units {
+                systemctl(&["disable", "--now", unit]);
+            }
+        }
+        tracing::info!(on, "OpenAI-compatible endpoint");
+        Ok(self.service_settings())
     }
 
     async fn configure_service(
@@ -1251,6 +1363,17 @@ impl Service {
         drop(settings);
         Ok(self.service_settings())
     }
+}
+
+/// `systemctl --user ARGS`, best effort (a test copy or a session without systemd).
+fn systemctl(args: &[&str]) {
+    let _ = std::process::Command::new("systemctl")
+        .arg("--user")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 }
 
 /// An image or audio clip's base64, from plain base64 or a `data:` URL.

@@ -24,12 +24,13 @@ only report updates, or `off`. llama.cpp itself never downloads.
 
 ## Coding tools
 
-AI Core serves an OpenAI-compatible API at `http://127.0.0.1:8080/v1` (loopback
-only; systemd starts AI Core on the first request). Point a coding tool there, pick
-a model ID from `GET /v1/models`, and give any placeholder key if it wants one.
-Requests share the scheduler with the Nyx apps: models load on demand and each
-request waits its turn. Set `openai_endpoint = ""` in `settings.toml` to turn it
-off (and drop the `127.0.0.1:8080` line from `nyx-aid.socket`).
+AI Core can serve an OpenAI-compatible API at `http://127.0.0.1:8080/v1` (loopback
+only). It's off until you turn it on in Settings › AI or with
+`nyx-ai service openai=on`, which makes an API key in `~/.config/nyx-ai/api-key`;
+give the coding tool that key, point it at the URL, and pick a model ID from
+`GET /v1/models`. Requests share the scheduler with the Nyx apps: models load on
+demand and each request waits its turn. `nyx-ai service openai=off` closes the
+port again.
 
 - [Architecture](docs/ARCHITECTURE.md)
 - [Protocol](docs/PROTOCOL.md)

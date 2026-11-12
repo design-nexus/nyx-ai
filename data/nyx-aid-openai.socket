@@ -1,0 +1,11 @@
+[Unit]
+Description=Nyx AI Core endpoint for coding tools (OpenAI-compatible, needs the API key)
+# Enabled by `nyx-ai service openai=on` (or Settings > AI), off otherwise. A port
+# taken by something else fails only this unit, never the apps' socket.
+
+[Socket]
+ListenStream=127.0.0.1:8080
+Service=nyx-aid.service
+
+[Install]
+WantedBy=sockets.target

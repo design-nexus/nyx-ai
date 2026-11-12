@@ -247,7 +247,7 @@ impl Client {
     }
 
     pub async fn configure_service(&self, max_loaded: Option<u32>, idle_unload_seconds: Option<i64>) -> Result<ServiceSettings> {
-        self.configure_service_with(Op::ConfigureService { max_loaded, idle_unload_seconds, model_updates: None, defaults: None, battery_saver: None, add_model_dirs: None }).await
+        self.configure_service_with(Op::ConfigureService { max_loaded, idle_unload_seconds, model_updates: None, defaults: None, battery_saver: None, add_model_dirs: None, openai: None }).await
     }
 
     /// List models from `dirs` too (an app's own model folder). Needs a trusted program.
@@ -259,6 +259,7 @@ impl Client {
             defaults: None,
             battery_saver: None,
             add_model_dirs: Some(dirs),
+            openai: None,
         })
         .await
     }

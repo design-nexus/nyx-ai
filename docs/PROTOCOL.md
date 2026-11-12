@@ -55,7 +55,7 @@ daemon. Lines are at most 64 MiB. A connection may have 32 requests open.
 | `worker_status` | | | `worker` |
 | `list_capabilities` | | | `capabilities` |
 | `service_settings` | | | `service` |
-| `configure_service` | `max_loaded`, `idle_unload_seconds`, `model_updates`, `defaults` (`{role: model}`, `""` clears), `battery_saver`, `add_model_dirs` (folders to list models from as well; absolute or under `~/`) (all optional) | | `service` |
+| `configure_service` | `max_loaded`, `idle_unload_seconds`, `model_updates`, `defaults` (`{role: model}`, `""` clears), `battery_saver`, `add_model_dirs` (folders to list models from as well; absolute or under `~/`), `openai` (the endpoint for coding tools on or off) (all optional) | | `service` |
 | `check_updates` | | | `models` (those with `update_available`) |
 | `list_actions` | | | `actions` |
 | `invoke_action` | `action`, `arguments` (JSON), `confirmed` | | `action_done` (`result`) |
@@ -245,6 +245,9 @@ shape (`{"error": {"code", "message", "type"}}`).
   folder, such as Glimpse's; the models are listed at once, never changed). An
   older daemon rejects the field, so clients treat `invalid_request` as "not
   available".
+- Version 1, additions: `configure_service`'s `openai` and
+  `ServiceSettings.openai_key_file`. The endpoint is off until `openai` turns it
+  on; an older daemon rejects the field.
 
 ## Battery saver
 

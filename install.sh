@@ -60,7 +60,7 @@ for b in nyx-aid nyx-ai; do
     install -m 755 "$src/$b" "$bin/$b"
   fi
 done
-install -m 644 "$src/data/nyx-aid.service" "$src/data/nyx-aid.socket" "$units/"
+install -m 644 "$src/data/nyx-aid.service" "$src/data/nyx-aid.socket" "$src/data/nyx-aid-openai.socket" "$units/"
 bash "$src/scripts/install-llama.sh"
 systemctl --user daemon-reload 2>/dev/null || true
 
@@ -70,6 +70,7 @@ fi
 # A running daemon would keep the old build and the socket its old addresses;
 # both start again on the next request.
 if systemctl --user is-active -q nyx-aid.socket 2>/dev/null; then
+  systemctl --user stop nyx-aid.service 2>/dev/null || true
   systemctl --user restart nyx-aid.socket || warn "Couldn't restart nyx-aid.socket"
 fi
 

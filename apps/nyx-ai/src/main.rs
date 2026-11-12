@@ -22,9 +22,9 @@ const USAGE: &str = "Usage: nyx-ai COMMAND [--json]
   unload MODEL                 unload unless something else uses it
   settings MODEL|* [KEY=VALUE…] show or change load-time settings (empty value removes)
   service [max_loaded=N] [idle=SECONDS] [updates=auto|notify|off] [battery_saver=on|off] [add_dir=FOLDER]
-                               show or change how many models stay loaded, for how long,
-                               whether models update themselves, and whether they run on
-                               the CPU on battery
+          [openai=on|off]      show or change how many models stay loaded, for how long,
+                               whether models update themselves, whether they run on
+                               the CPU on battery, and the endpoint for coding tools
   default ROLE [MODEL]         show or set the default model for a role (chat, assistant,
                                embedding, coding); \"\" clears it
   chat MODEL PROMPT…           ask a model (--think to show its reasoning)
@@ -251,6 +251,7 @@ async fn run(client: &Client, args: &[String], flags: Flags) -> nyx_ai_client::R
             let mut updates = None;
             let mut saver = None;
             let mut dirs: Option<Vec<String>> = None;
+            let mut openai = None;
             for kv in &args[1..] {
                 match kv.split_once('=') {
                     Some(("max_loaded", v)) => max = v.parse().ok(),
@@ -258,10 +259,11 @@ async fn run(client: &Client, args: &[String], flags: Flags) -> nyx_ai_client::R
                     Some(("updates", v)) | Some(("model_updates", v)) => updates = Some(v.to_string()),
                     Some(("battery_saver", v)) => saver = Some(matches!(v, "on" | "true" | "yes" | "1")),
                     Some(("add_dir", v)) | Some(("add_model_dir", v)) => dirs.get_or_insert_with(Vec::new).push(v.to_string()),
+                    Some(("openai", v)) | Some(("openai_endpoint", v)) => openai = Some(matches!(v, "on" | "true" | "yes" | "1")),
                     _ => {}
                 }
             }
-            let s = if max.is_none() && idle.is_none() && updates.is_none() && saver.is_none() && dirs.is_none() {
+            let s = if max.is_none() && idle.is_none() && updates.is_none() && saver.is_none() && dirs.is_none() && openai.is_none() {
                 client.service_settings().await?
             } else {
                 client
@@ -272,6 +274,7 @@ async fn run(client: &Client, args: &[String], flags: Flags) -> nyx_ai_client::R
                         defaults: None,
                         battery_saver: saver,
                         add_model_dirs: dirs,
+                        openai,
                     })
                     .await?
             };
@@ -291,7 +294,10 @@ async fn run(client: &Client, args: &[String], flags: Flags) -> nyx_ai_client::R
                 }
                 match &s.openai_endpoint {
                     Some(addr) => println!("openai_endpoint = {addr} (base URL http://{addr}/v1)"),
-                    None => println!("openai_endpoint = off"),
+                    None => println!("openai_endpoint = off  (nyx-ai service openai=on turns it on)"),
+                }
+                if let Some(file) = &s.openai_key_file {
+                    println!("openai_key_file = {file}  (the API key coding tools send)");
                 }
             }
         }
@@ -308,6 +314,7 @@ async fn run(client: &Client, args: &[String], flags: Flags) -> nyx_ai_client::R
                             defaults: Some([(role.clone(), model.clone())].into()),
                             battery_saver: None,
                             add_model_dirs: None,
+                            openai: None,
                         })
                         .await?
                 }
