@@ -4,11 +4,11 @@
 
 use crate::hf::{self, repo_dir, valid_file, valid_oid, valid_repo};
 use futures_util::StreamExt;
+use futures_util::future::BoxFuture;
 use nyx_ai_proto::{Download, DownloadState, Error, ErrorKind};
 use reqwest::header::RANGE;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use futures_util::future::BoxFuture;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -36,7 +36,11 @@ pub struct File {
 /// The files one quant needs: its parts, and the companions in `sidecars` that
 /// the repository has for it: the folder's projector, the quant's MTP head,
 /// and drafters (Q8_0 preferred, then the smallest).
-pub fn selected_files(tree: &[File], quant: &str, sidecars: &[String]) -> Result<Vec<File>, String> {
+pub fn selected_files(
+    tree: &[File],
+    quant: &str,
+    sidecars: &[String],
+) -> Result<Vec<File>, String> {
     let gguf = |f: &&File| f.path.to_ascii_lowercase().ends_with(".gguf");
     let first = tree
         .iter()
@@ -59,28 +63,52 @@ pub fn selected_files(tree: &[File], quant: &str, sidecars: &[String]) -> Result
         })?;
     let mut files = if let Some((prefix, _)) = first.path.rsplit_once("-00001-of-") {
         tree.iter()
-            .filter(|f| f.path.starts_with(prefix) && f.path.contains("-of-") && hf::quant_tag(&f.path) == quant)
+            .filter(|f| {
+                f.path.starts_with(prefix)
+                    && f.path.contains("-of-")
+                    && hf::quant_tag(&f.path) == quant
+            })
             .cloned()
             .collect::<Vec<_>>()
     } else {
         vec![first.clone()]
     };
     let folder = Path::new(&first.path).parent();
-    let stem = first.path.rsplit('/').next().unwrap_or(&first.path).trim_end_matches(".gguf").to_ascii_lowercase();
+    let stem = first
+        .path
+        .rsplit('/')
+        .next()
+        .unwrap_or(&first.path)
+        .trim_end_matches(".gguf")
+        .to_ascii_lowercase();
     let stem = stem.split("-00001-of-").next().unwrap_or(&stem).to_string();
     for kind in sidecars {
         let pick = tree
             .iter()
             .filter(gguf)
-            .filter(|f| Path::new(&f.path).parent() == folder && hf::sidecar_kind(&f.path) == Some(kind.as_str()))
+            .filter(|f| {
+                Path::new(&f.path).parent() == folder
+                    && hf::sidecar_kind(&f.path) == Some(kind.as_str())
+            })
             // An MTP head belongs to one quant: its name starts with the model's.
-            .filter(|f| kind != "mtp" || f.path.rsplit('/').next().unwrap_or(&f.path).to_ascii_lowercase().starts_with(&stem))
+            .filter(|f| {
+                kind != "mtp"
+                    || f.path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&f.path)
+                        .to_ascii_lowercase()
+                        .starts_with(&stem)
+            })
             .min_by_key(|f| (hf::quant_tag(&f.path) != "Q8_0", f.size));
         if let Some(file) = pick {
             files.push(file.clone());
         }
     }
-    if files.iter().any(|f| !valid_file(&f.path) || f.lfs.as_ref().is_none_or(|l| !valid_oid(&l.oid))) {
+    if files
+        .iter()
+        .any(|f| !valid_file(&f.path) || f.lfs.as_ref().is_none_or(|l| !valid_oid(&l.oid)))
+    {
         return Err("the repository has an invalid GGUF file path or checksum".into());
     }
     files.sort_by(|a, b| a.path.cmp(&b.path));
@@ -89,11 +117,17 @@ pub fn selected_files(tree: &[File], quant: &str, sidecars: &[String]) -> Result
 
 /// `org/repo:QUANT`, with the quant spelled the way file names carry it.
 pub fn parse_model(model: &str) -> Result<(String, String), Error> {
-    let (repo, tag) = model
-        .rsplit_once(':')
-        .ok_or_else(|| Error::new(ErrorKind::InvalidRequest, "name a Hugging Face model as org/repo:QUANT"))?;
+    let (repo, tag) = model.rsplit_once(':').ok_or_else(|| {
+        Error::new(
+            ErrorKind::InvalidRequest,
+            "name a Hugging Face model as org/repo:QUANT",
+        )
+    })?;
     if !valid_repo(repo) {
-        return Err(Error::new(ErrorKind::InvalidRequest, "invalid Hugging Face repository name"));
+        return Err(Error::new(
+            ErrorKind::InvalidRequest,
+            "invalid Hugging Face repository name",
+        ));
     }
     Ok((repo.to_string(), hf::quant_tag(tag)))
 }
@@ -133,8 +167,38 @@ impl Progress<'_> {
     }
 }
 
+/// What a download failing for want of a network says, as the System Manager says it.
+pub const OFFLINE: &str = "There's no network connection. Connect to the internet and try again.";
+
+/// Whether the request never reached the server: no DNS, no route, no connection.
+fn offline(e: &reqwest::Error) -> bool {
+    let mut chain = e.to_string();
+    let mut source = std::error::Error::source(e);
+    while let Some(s) = source {
+        chain.push_str(&format!(": {s}"));
+        source = s.source();
+    }
+    let chain = chain.to_ascii_lowercase();
+    e.is_connect()
+        && [
+            "dns error",
+            "failed to lookup address",
+            "name or service not known",
+            "temporary failure in name resolution",
+            "network is unreachable",
+            "no route to host",
+        ]
+        .iter()
+        .any(|m| chain.contains(m))
+}
+
 fn failed(what: &'static str) -> impl Fn(reqwest::Error) -> Error {
-    move |e| Error::new(ErrorKind::DownloadFailed, format!("{what}: {e}"))
+    move |e| {
+        if offline(&e) {
+            return Error::new(ErrorKind::DownloadFailed, OFFLINE.to_string());
+        }
+        Error::new(ErrorKind::DownloadFailed, format!("{what}: {e}"))
+    }
 }
 
 fn fetch(client: &reqwest::Client, token: Option<&str>, url: String) -> reqwest::RequestBuilder {
@@ -156,17 +220,43 @@ struct Job<'a> {
     total: u64,
 }
 
-async fn download_file(job: &Job<'_>, file: &File, completed: &mut u64, progress: &mut Progress<'_>) -> Result<(), Error> {
-    let Job { endpoint, client, token, repo, revision, base, total } = *job;
-    let io = |e: std::io::Error| Error::new(ErrorKind::DownloadFailed, format!("writing the download: {e}"));
+async fn download_file(
+    job: &Job<'_>,
+    file: &File,
+    completed: &mut u64,
+    progress: &mut Progress<'_>,
+) -> Result<(), Error> {
+    let Job {
+        endpoint,
+        client,
+        token,
+        repo,
+        revision,
+        base,
+        total,
+    } = *job;
+    let io = |e: std::io::Error| {
+        Error::new(
+            ErrorKind::DownloadFailed,
+            format!("writing the download: {e}"),
+        )
+    };
     let oid = &file.lfs.as_ref().expect("checked by selected_files").oid;
     let blob = base.join("blobs").join(oid);
     let partial = base.join("blobs").join(format!("{oid}.incomplete"));
-    tokio::fs::create_dir_all(base.join("blobs")).await.map_err(io)?;
-    if tokio::fs::metadata(&blob).await.is_ok_and(|m| m.len() == file.size) {
+    tokio::fs::create_dir_all(base.join("blobs"))
+        .await
+        .map_err(io)?;
+    if tokio::fs::metadata(&blob)
+        .await
+        .is_ok_and(|m| m.len() == file.size)
+    {
         *completed += file.size;
     } else {
-        let mut offset = tokio::fs::metadata(&partial).await.map(|m| m.len()).unwrap_or(0);
+        let mut offset = tokio::fs::metadata(&partial)
+            .await
+            .map(|m| m.len())
+            .unwrap_or(0);
         if offset > file.size {
             tokio::fs::remove_file(&partial).await.map_err(io)?;
             offset = 0;
@@ -174,7 +264,10 @@ async fn download_file(job: &Job<'_>, file: &File, completed: &mut u64, progress
         *completed += offset;
         progress.set("Downloading", *completed, total, true);
         if offset < file.size {
-            let url = format!("{endpoint}/{repo}/resolve/{revision}/{}", hf::encode_path(&file.path));
+            let url = format!(
+                "{endpoint}/{repo}/resolve/{revision}/{}",
+                hf::encode_path(&file.path)
+            );
             let mut request = fetch(client, token, url);
             if offset > 0 {
                 request = request.header(RANGE, format!("bytes={offset}-"));
@@ -183,24 +276,47 @@ async fn download_file(job: &Job<'_>, file: &File, completed: &mut u64, progress
                 .send()
                 .await
                 .and_then(|r| r.error_for_status())
-                .map_err(|e| Error::new(ErrorKind::DownloadFailed, format!("Hugging Face file download: {e}")))?;
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::DownloadFailed,
+                        format!("Hugging Face file download: {e}"),
+                    )
+                })?;
             if offset > 0 && response.status() != reqwest::StatusCode::PARTIAL_CONTENT {
                 *completed -= offset;
                 offset = 0;
             }
-            let mut out = tokio::fs::OpenOptions::new().create(true).write(true).truncate(false).open(&partial).await.map_err(io)?;
+            let mut out = tokio::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&partial)
+                .await
+                .map_err(io)?;
             if offset == 0 {
                 out.set_len(0).await.map_err(io)?;
             } else {
-                out.seek(std::io::SeekFrom::Start(offset)).await.map_err(io)?;
+                out.seek(std::io::SeekFrom::Start(offset))
+                    .await
+                    .map_err(io)?;
             }
             let mut stream = response.bytes_stream();
             loop {
                 let next = tokio::time::timeout(Duration::from_secs(60), stream.next())
                     .await
-                    .map_err(|_| Error::new(ErrorKind::DownloadFailed, "download stalled; download again to resume"))?;
+                    .map_err(|_| {
+                        Error::new(
+                            ErrorKind::DownloadFailed,
+                            "download stalled; download again to resume",
+                        )
+                    })?;
                 let Some(chunk) = next else { break };
-                let chunk = chunk.map_err(|e| Error::new(ErrorKind::DownloadFailed, format!("download interrupted ({e}); download again to resume")))?;
+                let chunk = chunk.map_err(|e| {
+                    Error::new(
+                        ErrorKind::DownloadFailed,
+                        format!("download interrupted ({e}); download again to resume"),
+                    )
+                })?;
                 out.write_all(&chunk).await.map_err(io)?;
                 *completed += chunk.len() as u64;
                 progress.set("Downloading", *completed, total, false);
@@ -209,7 +325,13 @@ async fn download_file(job: &Job<'_>, file: &File, completed: &mut u64, progress
         }
         let actual = tokio::fs::metadata(&partial).await.map_err(io)?.len();
         if actual != file.size {
-            return Err(Error::new(ErrorKind::DownloadFailed, format!("incomplete download of {}: {actual} of {} bytes", file.path, file.size)));
+            return Err(Error::new(
+                ErrorKind::DownloadFailed,
+                format!(
+                    "incomplete download of {}: {actual} of {} bytes",
+                    file.path, file.size
+                ),
+            ));
         }
         progress.set("Checking", *completed, total, true);
         let check_path = partial.clone();
@@ -232,19 +354,31 @@ async fn download_file(job: &Job<'_>, file: &File, completed: &mut u64, progress
         .map_err(io)?;
         if digest != *oid {
             tokio::fs::remove_file(&partial).await.map_err(io)?;
-            return Err(Error::new(ErrorKind::DownloadFailed, format!("checksum mismatch for {}", file.path)));
+            return Err(Error::new(
+                ErrorKind::DownloadFailed,
+                format!("checksum mismatch for {}", file.path),
+            ));
         }
-        if file.path.to_ascii_lowercase().ends_with(".gguf") && !crate::gguf::looks_like_gguf(&partial) {
+        if file.path.to_ascii_lowercase().ends_with(".gguf")
+            && !crate::gguf::looks_like_gguf(&partial)
+        {
             tokio::fs::remove_file(&partial).await.map_err(io)?;
-            return Err(Error::new(ErrorKind::DownloadFailed, format!("{} isn't a GGUF file", file.path)));
+            return Err(Error::new(
+                ErrorKind::DownloadFailed,
+                format!("{} isn't a GGUF file", file.path),
+            ));
         }
         tokio::fs::rename(&partial, &blob).await.map_err(io)?;
     }
     let snapshot = base.join("snapshots").join(revision).join(&file.path);
-    tokio::fs::create_dir_all(snapshot.parent().expect("snapshot has a folder")).await.map_err(io)?;
+    tokio::fs::create_dir_all(snapshot.parent().expect("snapshot has a folder"))
+        .await
+        .map_err(io)?;
     if tokio::fs::symlink_metadata(&snapshot).await.is_err() {
         let depth = Path::new(&file.path).components().count();
-        let link = PathBuf::from("../".repeat(depth + 1)).join("blobs").join(oid);
+        let link = PathBuf::from("../".repeat(depth + 1))
+            .join("blobs")
+            .join(oid);
         std::os::unix::fs::symlink(link, snapshot).map_err(io)?;
     }
     progress.set("Downloading", *completed, total, true);
@@ -260,7 +394,12 @@ pub fn client() -> Result<reqwest::Client, Error> {
 }
 
 /// A repository's newest revision and its files.
-pub async fn latest(client: &reqwest::Client, endpoint: &str, token: Option<&str>, repo: &str) -> Result<(String, Vec<File>), Error> {
+pub async fn latest(
+    client: &reqwest::Client,
+    endpoint: &str,
+    token: Option<&str>,
+    repo: &str,
+) -> Result<(String, Vec<File>), Error> {
     let encoded = hf::encode_path(repo);
     let info: RepoInfo = fetch(client, token, format!("{endpoint}/api/models/{encoded}"))
         .send()
@@ -271,16 +410,26 @@ pub async fn latest(client: &reqwest::Client, endpoint: &str, token: Option<&str
         .await
         .map_err(failed("Hugging Face model"))?;
     if info.sha.len() != 40 || !info.sha.bytes().all(|c| c.is_ascii_hexdigit()) {
-        return Err(Error::new(ErrorKind::DownloadFailed, "Hugging Face returned an invalid revision"));
+        return Err(Error::new(
+            ErrorKind::DownloadFailed,
+            "Hugging Face returned an invalid revision",
+        ));
     }
-    let tree: Vec<File> = fetch(client, token, format!("{endpoint}/api/models/{encoded}/tree/{}?recursive=true", info.sha))
-        .send()
-        .await
-        .and_then(|r| r.error_for_status())
-        .map_err(failed("Hugging Face file list"))?
-        .json()
-        .await
-        .map_err(failed("Hugging Face file list"))?;
+    let tree: Vec<File> = fetch(
+        client,
+        token,
+        format!(
+            "{endpoint}/api/models/{encoded}/tree/{}?recursive=true",
+            info.sha
+        ),
+    )
+    .send()
+    .await
+    .and_then(|r| r.error_for_status())
+    .map_err(failed("Hugging Face file list"))?
+    .json()
+    .await
+    .map_err(failed("Hugging Face file list"))?;
     Ok((info.sha, tree))
 }
 
@@ -297,10 +446,14 @@ pub async fn download(
 ) -> Result<String, Error> {
     let (repo, quant) = parse_model(model)?;
     let client = client()?;
-    let mut progress = Progress { tx, last: Instant::now() };
+    let mut progress = Progress {
+        tx,
+        last: Instant::now(),
+    };
     progress.set("Looking up the model", 0, 0, true);
     let (sha, tree) = latest(&client, endpoint, token, &repo).await?;
-    let files = selected_files(&tree, &quant, sidecars).map_err(|e| Error::new(ErrorKind::DownloadFailed, e))?;
+    let files = selected_files(&tree, &quant, sidecars)
+        .map_err(|e| Error::new(ErrorKind::DownloadFailed, e))?;
     let total: u64 = files.iter().map(|f| f.size).sum();
     let base = repo_dir(cache, &repo);
     let present: u64 = files
@@ -308,7 +461,9 @@ pub async fn download(
         .map(|f| {
             let oid = &f.lfs.as_ref().expect("checked").oid;
             std::fs::metadata(base.join("blobs").join(oid))
-                .or_else(|_| std::fs::metadata(base.join("blobs").join(format!("{oid}.incomplete"))))
+                .or_else(|_| {
+                    std::fs::metadata(base.join("blobs").join(format!("{oid}.incomplete")))
+                })
                 .map(|m| m.len().min(f.size))
                 .unwrap_or(0)
         })
@@ -318,11 +473,23 @@ pub async fn download(
     {
         return Err(Error::new(
             ErrorKind::ResourceExhausted,
-            format!("not enough disk space: the model needs {} GB more and {} GB are free", (total - present) / 1_000_000_000 + 1, free / 1_000_000_000),
+            format!(
+                "not enough disk space: the model needs {} GB more and {} GB are free",
+                (total - present) / 1_000_000_000 + 1,
+                free / 1_000_000_000
+            ),
         ));
     }
     let mut completed = 0;
-    let job = Job { endpoint, client: &client, token, repo: &repo, revision: &sha, base: &base, total };
+    let job = Job {
+        endpoint,
+        client: &client,
+        token,
+        repo: &repo,
+        revision: &sha,
+        base: &base,
+        total,
+    };
     for file in &files {
         download_file(&job, file, &mut completed, &mut progress).await?;
     }
@@ -345,8 +512,18 @@ pub fn snapshot_links(cache: &Path, repo: &str, revision: &str) -> BTreeMap<Stri
         for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
             let path = entry.path();
             if let Ok(target) = std::fs::read_link(&path) {
-                let oid = target.file_name().unwrap_or_default().to_string_lossy().into_owned();
-                out.insert(path.strip_prefix(&root).unwrap_or(&path).display().to_string(), oid);
+                let oid = target
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                out.insert(
+                    path.strip_prefix(&root)
+                        .unwrap_or(&path)
+                        .display()
+                        .to_string(),
+                    oid,
+                );
             } else if path.is_dir() {
                 dirs.push(path);
             }
@@ -362,7 +539,9 @@ pub fn switch_revision(cache: &Path, repo: &str, revision: &str) -> std::io::Res
     let base = repo_dir(cache, repo);
     let new = base.join("snapshots").join(revision);
     if !new.is_dir() {
-        return Err(std::io::Error::other(format!("{repo} has no snapshot {revision}")));
+        return Err(std::io::Error::other(format!(
+            "{repo} has no snapshot {revision}"
+        )));
     }
     let old = current_revision(cache, repo);
     if old.as_deref() == Some(revision) {
@@ -393,12 +572,20 @@ pub fn switch_revision(cache: &Path, repo: &str, revision: &str) -> std::io::Res
 pub fn prune(cache: &Path, repo: &str) -> u64 {
     let base = repo_dir(cache, repo);
     let mut used = std::collections::BTreeSet::new();
-    for snapshot in std::fs::read_dir(base.join("snapshots")).into_iter().flatten().flatten() {
+    for snapshot in std::fs::read_dir(base.join("snapshots"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
         let name = snapshot.file_name().to_string_lossy().into_owned();
         used.extend(snapshot_links(cache, repo, &name).into_values());
     }
     let mut freed = 0;
-    for blob in std::fs::read_dir(base.join("blobs")).into_iter().flatten().flatten() {
+    for blob in std::fs::read_dir(base.join("blobs"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
         let name = blob.file_name().to_string_lossy().into_owned();
         if name.ends_with(".incomplete") || used.contains(&name) {
             continue;
@@ -433,8 +620,21 @@ pub struct Downloads {
 
 impl Downloads {
     /// `endpoint`: Hugging Face's address (`hf::endpoint()`).
-    pub fn new(cache: PathBuf, endpoint: String, config_home: PathBuf, sidecars: Vec<String>, on_done: OnDone) -> Arc<Downloads> {
-        Arc::new(Downloads { cache, endpoint, config_home, sidecars, entries: Mutex::new(Vec::new()), on_done })
+    pub fn new(
+        cache: PathBuf,
+        endpoint: String,
+        config_home: PathBuf,
+        sidecars: Vec<String>,
+        on_done: OnDone,
+    ) -> Arc<Downloads> {
+        Arc::new(Downloads {
+            cache,
+            endpoint,
+            config_home,
+            sidecars,
+            entries: Mutex::new(Vec::new()),
+            on_done,
+        })
     }
 
     pub fn endpoint(&self) -> &str {
@@ -455,10 +655,17 @@ impl Downloads {
         self.queue(model, true)
     }
 
-    fn queue(self: &Arc<Self>, model: &str, auto: bool) -> Result<watch::Receiver<Download>, Error> {
+    fn queue(
+        self: &Arc<Self>,
+        model: &str,
+        auto: bool,
+    ) -> Result<watch::Receiver<Download>, Error> {
         parse_model(model)?;
         let mut entries = self.entries.lock().expect("downloads");
-        if let Some(e) = entries.iter_mut().find(|e| e.tx.borrow().model == model && active(e.tx.borrow().state)) {
+        if let Some(e) = entries
+            .iter_mut()
+            .find(|e| e.tx.borrow().model == model && active(e.tx.borrow().state))
+        {
             e.auto &= auto;
             return Ok(e.tx.subscribe());
         }
@@ -471,7 +678,11 @@ impl Downloads {
             total: 0,
             error: None,
         });
-        entries.push(Entry { tx, abort: None, auto });
+        entries.push(Entry {
+            tx,
+            abort: None,
+            auto,
+        });
         drop(entries);
         self.pump();
         Ok(rx)
@@ -495,7 +706,10 @@ impl Downloads {
 
     pub fn cancel(self: &Arc<Self>, model: &str) -> bool {
         let mut entries = self.entries.lock().expect("downloads");
-        let Some(entry) = entries.iter_mut().find(|e| e.tx.borrow().model == model && active(e.tx.borrow().state)) else {
+        let Some(entry) = entries
+            .iter_mut()
+            .find(|e| e.tx.borrow().model == model && active(e.tx.borrow().state))
+        else {
             return false;
         };
         if let Some(abort) = entry.abort.take() {
@@ -511,19 +725,36 @@ impl Downloads {
     }
 
     pub fn list(&self) -> Vec<Download> {
-        self.entries.lock().expect("downloads").iter().map(|e| e.tx.borrow().clone()).collect()
+        self.entries
+            .lock()
+            .expect("downloads")
+            .iter()
+            .map(|e| e.tx.borrow().clone())
+            .collect()
     }
 
     pub fn active(&self, model: &str) -> bool {
-        self.entries.lock().expect("downloads").iter().any(|e| e.tx.borrow().model == model && active(e.tx.borrow().state))
+        self.entries
+            .lock()
+            .expect("downloads")
+            .iter()
+            .any(|e| e.tx.borrow().model == model && active(e.tx.borrow().state))
     }
 
     fn pump(self: &Arc<Self>) {
         let mut entries = self.entries.lock().expect("downloads");
-        if entries.iter().any(|e| e.tx.borrow().state == DownloadState::Running) {
+        if entries
+            .iter()
+            .any(|e| e.tx.borrow().state == DownloadState::Running)
+        {
             return;
         }
-        let Some(entry) = entries.iter_mut().find(|e| e.tx.borrow().state == DownloadState::Queued) else { return };
+        let Some(entry) = entries
+            .iter_mut()
+            .find(|e| e.tx.borrow().state == DownloadState::Queued)
+        else {
+            return;
+        };
         entry.tx.send_modify(|d| {
             d.state = DownloadState::Running;
             d.status = "Starting".into();
@@ -534,7 +765,15 @@ impl Downloads {
             let model = tx.borrow().model.clone();
             let token = hf::token(&me.config_home);
             tracing::info!(%model, "download started");
-            let result = download(&me.cache, &me.endpoint, token.as_deref(), &model, &me.sidecars, &tx).await;
+            let result = download(
+                &me.cache,
+                &me.endpoint,
+                token.as_deref(),
+                &model,
+                &me.sidecars,
+                &tx,
+            )
+            .await;
             if let Ok(revision) = &result {
                 tx.send_modify(|d| d.status = "Putting it in use".into());
                 (me.on_done)(model.clone(), revision.clone()).await;
@@ -555,11 +794,15 @@ impl Downloads {
                 Ok(revision) => tracing::info!(%model, %revision, "download finished"),
                 Err(e) => tracing::warn!(%model, error = %e, "download failed"),
             }
-            me.entries.lock().expect("downloads").iter_mut().for_each(|e| {
-                if e.tx.same_channel(&tx) {
-                    e.abort = None;
-                }
-            });
+            me.entries
+                .lock()
+                .expect("downloads")
+                .iter_mut()
+                .for_each(|e| {
+                    if e.tx.same_channel(&tx) {
+                        e.abort = None;
+                    }
+                });
             me.pump();
         });
         entry.abort = Some(task.abort_handle());
@@ -570,10 +813,16 @@ impl Downloads {
 /// repository's folder if nothing finished in it either. Returns whether there
 /// was anything to drop.
 pub fn discard_partial(cache: &Path, model: &str) -> bool {
-    let Ok((repo, _)) = parse_model(model) else { return false };
+    let Ok((repo, _)) = parse_model(model) else {
+        return false;
+    };
     let base = repo_dir(cache, &repo);
     let mut found = false;
-    for entry in std::fs::read_dir(base.join("blobs")).into_iter().flatten().flatten() {
+    for entry in std::fs::read_dir(base.join("blobs"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
         if entry.file_name().to_string_lossy().ends_with(".incomplete") {
             found |= std::fs::remove_file(entry.path()).is_ok();
         }
@@ -595,7 +844,13 @@ pub(crate) mod tests {
     use std::sync::atomic::Ordering;
 
     fn file(path: &str, size: u64) -> File {
-        File { path: path.into(), size, lfs: Some(Lfs { oid: "a".repeat(64) }) }
+        File {
+            path: path.into(),
+            size,
+            lfs: Some(Lfs {
+                oid: "a".repeat(64),
+            }),
+        }
     }
 
     fn names(files: &[File]) -> Vec<&str> {
@@ -618,28 +873,65 @@ pub(crate) mod tests {
             file("m-DFlash2-Q8_0.gguf", 3),
         ];
         let files = selected_files(&tree, "PTQ1_0", &kinds(&["mmproj", "mtp"])).unwrap();
-        assert_eq!(names(&files), ["m-PTQ1_0-MTP-Q8_0.gguf", "m-PTQ1_0.gguf", "m-mmproj-Q8_0.gguf"]);
+        assert_eq!(
+            names(&files),
+            [
+                "m-PTQ1_0-MTP-Q8_0.gguf",
+                "m-PTQ1_0.gguf",
+                "m-mmproj-Q8_0.gguf"
+            ]
+        );
         let files = selected_files(&tree, "PQ2_0", &kinds(&["mmproj", "mtp", "dflash"])).unwrap();
-        assert_eq!(names(&files), ["m-DFlash2-Q8_0.gguf", "m-PQ2_0-MTP-Q8_0.gguf", "m-PQ2_0.gguf", "m-mmproj-Q8_0.gguf"]);
-        assert_eq!(names(&selected_files(&tree, "PQ2_0", &[]).unwrap()), ["m-PQ2_0.gguf"]);
+        assert_eq!(
+            names(&files),
+            [
+                "m-DFlash2-Q8_0.gguf",
+                "m-PQ2_0-MTP-Q8_0.gguf",
+                "m-PQ2_0.gguf",
+                "m-mmproj-Q8_0.gguf"
+            ]
+        );
+        assert_eq!(
+            names(&selected_files(&tree, "PQ2_0", &[]).unwrap()),
+            ["m-PQ2_0.gguf"]
+        );
     }
 
     #[test]
     fn selects_split_parts() {
-        let tree = [file("Q8_0/a-Q8_0-00001-of-00002.gguf", 5), file("Q8_0/a-Q8_0-00002-of-00002.gguf", 5), file("a-Q4_K_M.gguf", 3)];
+        let tree = [
+            file("Q8_0/a-Q8_0-00001-of-00002.gguf", 5),
+            file("Q8_0/a-Q8_0-00002-of-00002.gguf", 5),
+            file("a-Q4_K_M.gguf", 3),
+        ];
         assert_eq!(selected_files(&tree, "Q8_0", &[]).unwrap().len(), 2);
     }
 
     #[test]
     fn rejects_drafters_and_bad_paths() {
         let tree = [file("model-DFlash2-Q8_0.gguf", 8)];
-        assert!(selected_files(&tree, "Q8_0", &[]).unwrap_err().contains("companion drafter"));
+        assert!(
+            selected_files(&tree, "Q8_0", &[])
+                .unwrap_err()
+                .contains("companion drafter")
+        );
         let tree = [file("../escape-Q4_0.gguf", 8)];
-        assert!(selected_files(&tree, "Q4_0", &[]).unwrap_err().contains("invalid"));
-        let tree = [File { path: "m-Q4_0.gguf".into(), size: 1, lfs: None }];
+        assert!(
+            selected_files(&tree, "Q4_0", &[])
+                .unwrap_err()
+                .contains("invalid")
+        );
+        let tree = [File {
+            path: "m-Q4_0.gguf".into(),
+            size: 1,
+            lfs: None,
+        }];
         assert!(selected_files(&tree, "Q4_0", &[]).is_err());
         assert!(parse_model("../x:Q4").is_err());
-        assert_eq!(parse_model("o/r:q4_k_m").unwrap(), ("o/r".into(), "Q4_K_M".into()));
+        assert_eq!(
+            parse_model("o/r:q4_k_m").unwrap(),
+            ("o/r".into(), "Q4_K_M".into())
+        );
     }
 
     #[test]
@@ -650,7 +942,15 @@ pub(crate) mod tests {
     pub(crate) use crate::testhub::{fake_hub, gguf_bytes};
 
     pub(crate) fn progress() -> watch::Sender<Download> {
-        watch::channel(Download { model: "o/r:Q4_0".into(), state: DownloadState::Running, status: String::new(), completed: 0, total: 0, error: None }).0
+        watch::channel(Download {
+            model: "o/r:Q4_0".into(),
+            state: DownloadState::Running,
+            status: String::new(),
+            completed: 0,
+            total: 0,
+            error: None,
+        })
+        .0
     }
 
     #[tokio::test]
@@ -662,26 +962,54 @@ pub(crate) mod tests {
         let cache = tempfile::tempdir().unwrap();
         let base = repo_dir(cache.path(), "o/r");
         std::fs::create_dir_all(base.join("blobs")).unwrap();
-        std::fs::write(base.join("blobs").join(format!("{oid}.incomplete")), &body[..50_000]).unwrap();
+        std::fs::write(
+            base.join("blobs").join(format!("{oid}.incomplete")),
+            &body[..50_000],
+        )
+        .unwrap();
         let tx = progress();
-        let revision = download(cache.path(), &endpoint, None, "o/r:q4_0", &[], &tx).await.unwrap();
+        let revision = download(cache.path(), &endpoint, None, "o/r:q4_0", &[], &tx)
+            .await
+            .unwrap();
         assert_eq!(revision, "a".repeat(40));
-        assert_eq!(hub.ranges.load(Ordering::SeqCst), 1, "it resumed from the partial file");
+        assert_eq!(
+            hub.ranges.load(Ordering::SeqCst),
+            1,
+            "it resumed from the partial file"
+        );
         assert_eq!(std::fs::read(base.join("blobs").join(&oid)).unwrap(), body);
         let snapshot = base.join("snapshots").join(&revision).join("m-Q4_0.gguf");
         assert_eq!(std::fs::read(&snapshot).unwrap(), body);
-        assert!(current_revision(cache.path(), "o/r").is_none(), "a download doesn't put itself in use");
-        assert_eq!((tx.borrow().completed, tx.borrow().total), (body.len() as u64, body.len() as u64));
+        assert!(
+            current_revision(cache.path(), "o/r").is_none(),
+            "a download doesn't put itself in use"
+        );
+        assert_eq!(
+            (tx.borrow().completed, tx.borrow().total),
+            (body.len() as u64, body.len() as u64)
+        );
         switch_revision(cache.path(), "o/r", &revision).unwrap();
-        assert_eq!(current_revision(cache.path(), "o/r").as_deref(), Some(revision.as_str()));
+        assert_eq!(
+            current_revision(cache.path(), "o/r").as_deref(),
+            Some(revision.as_str())
+        );
         assert_eq!(hf::cached_file(cache.path(), "o/r:Q4_0").unwrap(), snapshot);
 
         hub.lie_about("m-Q4_0.gguf");
         let other = tempfile::tempdir().unwrap();
-        let err = download(other.path(), &endpoint, None, "o/r:Q4_0", &[], &progress()).await.unwrap_err();
+        let err = download(other.path(), &endpoint, None, "o/r:Q4_0", &[], &progress())
+            .await
+            .unwrap_err();
         assert!(err.message.contains("checksum mismatch"), "{err:?}");
-        assert!(!repo_dir(other.path(), "o/r").join("blobs").join(format!("{}.incomplete", "b".repeat(64))).exists());
-        let err = download(other.path(), &endpoint, None, "o/r:Q8_0", &[], &progress()).await.unwrap_err();
+        assert!(
+            !repo_dir(other.path(), "o/r")
+                .join("blobs")
+                .join(format!("{}.incomplete", "b".repeat(64)))
+                .exists()
+        );
+        let err = download(other.path(), &endpoint, None, "o/r:Q8_0", &[], &progress())
+            .await
+            .unwrap_err();
         assert!(err.message.contains("not in the Hugging Face repository"));
     }
 
@@ -689,22 +1017,43 @@ pub(crate) mod tests {
     async fn switching_keeps_other_quants_and_prunes_replaced_blobs() {
         let (endpoint, hub) = fake_hub().await;
         let cache = tempfile::tempdir().unwrap();
-        let (q4, q8, q4_new) = (gguf_bytes(1, 1000), gguf_bytes(2, 1000), gguf_bytes(3, 1000));
+        let (q4, q8, q4_new) = (
+            gguf_bytes(1, 1000),
+            gguf_bytes(2, 1000),
+            gguf_bytes(3, 1000),
+        );
         hub.set("a", &[("m-Q4_0.gguf", &q4), ("m-Q8_0.gguf", &q8)]);
         for model in ["o/r:Q4_0", "o/r:Q8_0"] {
-            let rev = download(cache.path(), &endpoint, None, model, &[], &progress()).await.unwrap();
+            let rev = download(cache.path(), &endpoint, None, model, &[], &progress())
+                .await
+                .unwrap();
             switch_revision(cache.path(), "o/r", &rev).unwrap();
         }
         hub.set("b", &[("m-Q4_0.gguf", &q4_new), ("m-Q8_0.gguf", &q8)]);
-        let rev = download(cache.path(), &endpoint, None, "o/r:Q4_0", &[], &progress()).await.unwrap();
+        let rev = download(cache.path(), &endpoint, None, "o/r:Q4_0", &[], &progress())
+            .await
+            .unwrap();
         switch_revision(cache.path(), "o/r", &rev).unwrap();
         let links = snapshot_links(cache.path(), "o/r", &rev);
         assert_eq!(links.len(), 2, "the Q8_0 file came along: {links:?}");
-        assert_eq!(std::fs::read(hf::cached_file(cache.path(), "o/r:Q4_0").unwrap()).unwrap(), q4_new);
-        assert_eq!(std::fs::read(hf::cached_file(cache.path(), "o/r:Q8_0").unwrap()).unwrap(), q8);
-        let blobs = std::fs::read_dir(repo_dir(cache.path(), "o/r").join("blobs")).unwrap().count();
+        assert_eq!(
+            std::fs::read(hf::cached_file(cache.path(), "o/r:Q4_0").unwrap()).unwrap(),
+            q4_new
+        );
+        assert_eq!(
+            std::fs::read(hf::cached_file(cache.path(), "o/r:Q8_0").unwrap()).unwrap(),
+            q8
+        );
+        let blobs = std::fs::read_dir(repo_dir(cache.path(), "o/r").join("blobs"))
+            .unwrap()
+            .count();
         assert_eq!(blobs, 2, "the old Q4_0 blob is gone");
-        assert!(!repo_dir(cache.path(), "o/r").join("snapshots").join("a".repeat(40)).exists());
+        assert!(
+            !repo_dir(cache.path(), "o/r")
+                .join("snapshots")
+                .join("a".repeat(40))
+                .exists()
+        );
     }
 
     #[test]

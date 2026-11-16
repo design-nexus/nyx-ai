@@ -49,7 +49,12 @@ impl Default for Actions {
 
 impl Actions {
     pub fn with_registry(registry: Registry) -> Self {
-        Actions { providers: Mutex::default(), pending: Mutex::default(), registry, next: AtomicU64::new(0) }
+        Actions {
+            providers: Mutex::default(),
+            pending: Mutex::default(),
+            registry,
+            next: AtomicU64::new(0),
+        }
     }
 
     /// Everything on offer: registered providers first, then Nyx apps. With `detail`,
@@ -68,14 +73,28 @@ impl Actions {
             }
         }
         list.sort_by(|a, b| a.spec.id.cmp(&b.spec.id));
-        let apps = detail.then(|| catalog.apps.iter().filter_map(|e| serde_json::to_value(e).ok()).collect());
+        let apps = detail.then(|| {
+            catalog
+                .apps
+                .iter()
+                .filter_map(|e| serde_json::to_value(e).ok())
+                .collect()
+        });
         (list, apps)
     }
 
     /// Offer `specs` for this connection until `cancel`.
-    pub async fn serve(&self, caller: &Caller, specs: Vec<ActionSpec>, events: mpsc::Sender<Event>, cancel: CancellationToken) -> Result<(), Error> {
+    pub async fn serve(
+        &self,
+        caller: &Caller,
+        specs: Vec<ActionSpec>,
+        events: mpsc::Sender<Event>,
+        cancel: CancellationToken,
+    ) -> Result<(), Error> {
         if specs.is_empty() || specs.len() > MAX_ACTIONS {
-            return Err(invalid(format!("offer between 1 and {MAX_ACTIONS} actions")));
+            return Err(invalid(format!(
+                "offer between 1 and {MAX_ACTIONS} actions"
+            )));
         }
         for spec in &specs {
             check_spec(spec)?;
@@ -90,22 +109,52 @@ impl Actions {
                 return Err(invalid("an action is offered twice"));
             }
             for spec in specs {
-                let info = ActionInfo { spec, owner: caller.name.clone(), source: "connection".into(), available: true };
-                providers.insert(info.spec.id.clone(), Provider { info, connection: caller.connection, events: events.clone() });
+                let info = ActionInfo {
+                    spec,
+                    owner: caller.name.clone(),
+                    source: "connection".into(),
+                    available: true,
+                };
+                providers.insert(
+                    info.spec.id.clone(),
+                    Provider {
+                        info,
+                        connection: caller.connection,
+                        events: events.clone(),
+                    },
+                );
             }
         }
         tracing::info!(client = %caller.name, actions = ids.len(), "serving actions");
         cancel.cancelled().await;
-        self.providers.lock().expect("providers").retain(|_, p| p.connection != caller.connection);
-        self.pending.lock().expect("pending").retain(|_, p| p.connection != caller.connection);
+        self.providers
+            .lock()
+            .expect("providers")
+            .retain(|_, p| p.connection != caller.connection);
+        self.pending
+            .lock()
+            .expect("pending")
+            .retain(|_, p| p.connection != caller.connection);
         Ok(())
     }
 
     /// The answer to invocation `id`, from the connection it was sent to.
-    pub fn answer(&self, caller: &Caller, id: u64, ok: Option<Value>, error: Option<String>) -> Result<(), Error> {
+    pub fn answer(
+        &self,
+        caller: &Caller,
+        id: u64,
+        ok: Option<Value>,
+        error: Option<String>,
+    ) -> Result<(), Error> {
         let mut pending = self.pending.lock().expect("pending");
-        if pending.get(&id).is_none_or(|p| p.connection != caller.connection) {
-            return Err(Error::new(ErrorKind::UnknownRequest, format!("no open invocation {id}")));
+        if pending
+            .get(&id)
+            .is_none_or(|p| p.connection != caller.connection)
+        {
+            return Err(Error::new(
+                ErrorKind::UnknownRequest,
+                format!("no open invocation {id}"),
+            ));
         }
         let p = pending.remove(&id).expect("checked");
         let _ = p.reply.send(match (ok, error) {
@@ -116,20 +165,48 @@ impl Actions {
     }
 
     /// Check and route one call.
-    pub async fn invoke(&self, caller: &Caller, id: &str, arguments: Value, confirmed: bool, allow_untrusted: bool, cancel: &CancellationToken) -> Result<Value, Error> {
+    pub async fn invoke(
+        &self,
+        caller: &Caller,
+        id: &str,
+        arguments: Value,
+        confirmed: bool,
+        allow_untrusted: bool,
+        cancel: &CancellationToken,
+    ) -> Result<Value, Error> {
         let trusted = caller.trusted || allow_untrusted;
-        let arguments = if arguments.is_null() { json!({}) } else { arguments };
-        let provider = self.providers.lock().expect("providers").get(id).map(|p| (p.info.clone(), p.events.clone(), p.connection));
+        let arguments = if arguments.is_null() {
+            json!({})
+        } else {
+            arguments
+        };
+        let provider = self
+            .providers
+            .lock()
+            .expect("providers")
+            .get(id)
+            .map(|p| (p.info.clone(), p.events.clone(), p.connection));
         let Some((info, events, connection)) = provider else {
-            let options = InvokeOptions { confirmed, trusted, on_behalf_of: Some(caller.name.clone()), frontend: "ai-core".into() };
+            let options = InvokeOptions {
+                confirmed,
+                trusted,
+                on_behalf_of: Some(caller.name.clone()),
+                frontend: "ai-core".into(),
+            };
             return tokio::select! {
                 r = self.registry.invoke(id, arguments, &options) => r.map_err(from_actions),
                 _ = cancel.cancelled() => Err(Error::new(ErrorKind::Cancelled, "cancelled")),
             };
         };
         let started = Instant::now();
-        nyx_actions::check::check_call(trusted, &action(&info.spec), &arguments, confirmed).map_err(from_actions)?;
-        let timeout = info.spec.timeout_ms.map(Duration::from_millis).unwrap_or(DEFAULT_TIMEOUT).min(MAX_TIMEOUT);
+        nyx_actions::check::check_call(trusted, &action(&info.spec), &arguments, confirmed)
+            .map_err(from_actions)?;
+        let timeout = info
+            .spec
+            .timeout_ms
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_TIMEOUT)
+            .min(MAX_TIMEOUT);
         let result = tokio::select! {
             r = tokio::time::timeout(timeout, self.call_provider(caller, events, connection, id, arguments)) => r.unwrap_or_else(|_| Err(Error::new(ErrorKind::Timeout, format!("{id} took longer than {} s", timeout.as_secs())))),
             _ = cancel.cancelled() => Err(Error::new(ErrorKind::Cancelled, "cancelled")),
@@ -143,11 +220,26 @@ impl Actions {
         result
     }
 
-    async fn call_provider(&self, caller: &Caller, events: mpsc::Sender<Event>, connection: u64, id: &str, arguments: Value) -> Result<Value, Error> {
+    async fn call_provider(
+        &self,
+        caller: &Caller,
+        events: mpsc::Sender<Event>,
+        connection: u64,
+        id: &str,
+        arguments: Value,
+    ) -> Result<Value, Error> {
         let invocation = self.next.fetch_add(1, Ordering::Relaxed) + 1;
         let (reply, answer) = oneshot::channel();
-        self.pending.lock().expect("pending").insert(invocation, Pending { connection, reply });
-        let event = Event::Invoke { invocation, action: id.to_string(), arguments, caller: caller.name.clone() };
+        self.pending
+            .lock()
+            .expect("pending")
+            .insert(invocation, Pending { connection, reply });
+        let event = Event::Invoke {
+            invocation,
+            action: id.to_string(),
+            arguments,
+            caller: caller.name.clone(),
+        };
         if events.send(event).await.is_err() {
             self.pending.lock().expect("pending").remove(&invocation);
             return Err(gone(id));
@@ -178,12 +270,25 @@ fn info(owner: &str, listed: &Listed) -> ActionInfo {
         input_schema: a.input_schema.clone(),
         output_schema: a.output_schema.clone(),
         permissions: a.permissions.clone(),
-        confirmation: if a.asks() { Confirmation::Ask } else { Confirmation::Never },
+        confirmation: if a.asks() {
+            Confirmation::Ask
+        } else {
+            Confirmation::Never
+        },
         side_effects,
         timeout_ms: a.timeout_ms,
     };
-    let source = if listed.source == nyx_actions::Source::Manifest { "manifest" } else { "dbus" };
-    ActionInfo { spec, owner: owner.to_string(), source: source.into(), available: listed.available }
+    let source = if listed.source == nyx_actions::Source::Manifest {
+        "manifest"
+    } else {
+        "dbus"
+    };
+    ActionInfo {
+        spec,
+        owner: owner.to_string(),
+        source: source.into(),
+        available: listed.available,
+    }
 }
 
 /// A provider's spec as nyx-actions checks it.
@@ -203,7 +308,11 @@ fn action(spec: &ActionSpec) -> nyx_actions::Action {
         input_schema: spec.input_schema.clone(),
         output_schema: spec.output_schema.clone(),
         risk,
-        confirmation: if asks { nyx_actions::Confirmation::Ask } else { nyx_actions::Confirmation::Never },
+        confirmation: if asks {
+            nyx_actions::Confirmation::Ask
+        } else {
+            nyx_actions::Confirmation::Never
+        },
         aliases: Vec::new(),
         keywords: Vec::new(),
         positional: Vec::new(),
@@ -247,7 +356,10 @@ fn invalid(message: impl Into<String>) -> Error {
 }
 
 fn gone(id: &str) -> Error {
-    Error::new(ErrorKind::Unavailable, format!("the app offering {id} went away"))
+    Error::new(
+        ErrorKind::Unavailable,
+        format!("the app offering {id} went away"),
+    )
 }
 
 pub fn valid_action_id(id: &str) -> bool {
@@ -256,13 +368,20 @@ pub fn valid_action_id(id: &str) -> bool {
 
 fn check_spec(spec: &ActionSpec) -> Result<(), Error> {
     if !valid_action_id(&spec.id) {
-        return Err(invalid(format!("{:?} isn't an action ID (app.verb, lowercase)", spec.id)));
+        return Err(invalid(format!(
+            "{:?} isn't an action ID (app.verb, lowercase)",
+            spec.id
+        )));
     }
     if spec.description.trim().is_empty() || spec.description.len() > 2000 {
-        return Err(invalid(format!("{} needs a description (up to 2000 characters)", spec.id)));
+        return Err(invalid(format!(
+            "{} needs a description (up to 2000 characters)",
+            spec.id
+        )));
     }
     for schema in std::iter::once(&spec.input_schema).chain(spec.output_schema.as_ref()) {
-        jsonschema::validator_for(schema).map_err(|e| invalid(format!("{}'s schema doesn't compile: {e}", spec.id)))?;
+        jsonschema::validator_for(schema)
+            .map_err(|e| invalid(format!("{}'s schema doesn't compile: {e}", spec.id)))?;
     }
     Ok(())
 }
@@ -284,8 +403,14 @@ mod tests {
         }
     }
 
-    fn check(trusted: bool, s: &ActionSpec, arguments: &Value, confirmed: bool) -> Result<(), Error> {
-        nyx_actions::check::check_call(trusted, &action(s), arguments, confirmed).map_err(from_actions)
+    fn check(
+        trusted: bool,
+        s: &ActionSpec,
+        arguments: &Value,
+        confirmed: bool,
+    ) -> Result<(), Error> {
+        nyx_actions::check::check_call(trusted, &action(s), arguments, confirmed)
+            .map_err(from_actions)
     }
 
     #[test]
@@ -295,15 +420,25 @@ mod tests {
         let ok = json!({"text": "milk"});
         check(true, &read, &ok, false).unwrap();
         check(false, &read, &ok, false).unwrap();
-        assert_eq!(check(false, &write, &ok, true).unwrap_err().kind, ErrorKind::PermissionDenied);
-        assert_eq!(check(true, &write, &ok, false).unwrap_err().kind, ErrorKind::ConfirmationRequired);
+        assert_eq!(
+            check(false, &write, &ok, true).unwrap_err().kind,
+            ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            check(true, &write, &ok, false).unwrap_err().kind,
+            ErrorKind::ConfirmationRequired
+        );
         check(true, &write, &ok, true).unwrap();
         let bad = check(true, &read, &json!({"text": 3}), false).unwrap_err();
         assert_eq!(bad.kind, ErrorKind::InvalidRequest);
         assert!(bad.message.contains("/text"), "{}", bad.message);
         assert!(check(true, &read, &json!({"text": "a", "extra": 1}), false).is_err());
         let delete = spec("notes.drop", SideEffects::Destructive, Confirmation::Never);
-        assert_eq!(check(true, &delete, &ok, false).unwrap_err().kind, ErrorKind::ConfirmationRequired, "destructive always asks");
+        assert_eq!(
+            check(true, &delete, &ok, false).unwrap_err().kind,
+            ErrorKind::ConfirmationRequired,
+            "destructive always asks"
+        );
     }
 
     #[test]
@@ -330,7 +465,20 @@ mod tests {
         let (catalog, _) = nyx_actions::Catalog::merge(vec![d], vec![], &|_| None);
         let (entry, listed) = catalog.find("files.trash").unwrap();
         let v1 = info(&entry.app.app, listed);
-        assert_eq!((v1.spec.side_effects, v1.spec.confirmation, v1.source.as_str(), v1.available), (SideEffects::Destructive, Confirmation::Ask, "manifest", true));
+        assert_eq!(
+            (
+                v1.spec.side_effects,
+                v1.spec.confirmation,
+                v1.source.as_str(),
+                v1.available
+            ),
+            (
+                SideEffects::Destructive,
+                Confirmation::Ask,
+                "manifest",
+                true
+            )
+        );
         // An old client reads it: ActionSpec is strict, so nothing new may appear in it.
         let text = serde_json::to_string(&v1).unwrap();
         serde_json::from_str::<ActionInfo>(&text).unwrap();

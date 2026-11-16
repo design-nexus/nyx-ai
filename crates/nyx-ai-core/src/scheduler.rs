@@ -52,7 +52,15 @@ struct Slot {
 
 impl Slot {
     fn new() -> Slot {
-        Slot { load: Load::Unloaded, active: 0, slots: 1, pins: BTreeSet::new(), last_used: Instant::now(), estimate: 0, pending: false }
+        Slot {
+            load: Load::Unloaded,
+            active: 0,
+            slots: 1,
+            pins: BTreeSet::new(),
+            last_used: Instant::now(),
+            estimate: 0,
+            pending: false,
+        }
     }
 }
 
@@ -88,11 +96,15 @@ struct State {
 
 impl State {
     fn slot(&mut self, model: &str) -> &mut Slot {
-        self.models.entry(model.to_string()).or_insert_with(Slot::new)
+        self.models
+            .entry(model.to_string())
+            .or_insert_with(Slot::new)
     }
 
     fn loaded(&self, model: &str) -> bool {
-        self.models.get(model).is_some_and(|s| s.load == Load::Loaded)
+        self.models
+            .get(model)
+            .is_some_and(|s| s.load == Load::Loaded)
     }
 
     fn waiting_for(&self, model: &str) -> bool {
@@ -101,21 +113,33 @@ impl State {
 
     /// The waiter that gets the next slot of `model`.
     fn pick(&self, model: &str, now: Instant) -> Option<u64> {
-        let interactive = self.waiters.iter().any(|w| w.priority == Priority::Interactive);
+        let interactive = self
+            .waiters
+            .iter()
+            .any(|w| w.priority == Priority::Interactive);
         self.waiters
             .iter()
             .filter(|w| w.model == model)
             .filter(|w| !(interactive && w.effective(now) == 0))
             .max_by_key(|w| {
-                (w.effective(now), std::cmp::Reverse(self.by_client.get(&w.client).copied().unwrap_or(0)), std::cmp::Reverse(w.since))
+                (
+                    w.effective(now),
+                    std::cmp::Reverse(self.by_client.get(&w.client).copied().unwrap_or(0)),
+                    std::cmp::Reverse(w.since),
+                )
             })
             .map(|w| w.id)
     }
 
     fn position(&self, id: u64, model: &str, now: Instant) -> usize {
-        let Some(me) = self.waiters.iter().find(|w| w.id == id) else { return 0 };
+        let Some(me) = self.waiters.iter().find(|w| w.id == id) else {
+            return 0;
+        };
         let key = |w: &Waiter| (w.effective(now), std::cmp::Reverse(w.since));
-        self.waiters.iter().filter(|w| w.model == model && w.id != id && key(w) > key(me)).count()
+        self.waiters
+            .iter()
+            .filter(|w| w.model == model && w.id != id && key(w) > key(me))
+            .count()
     }
 
     /// An idle model to evict for `model`: unpinned before pinned, then least
@@ -176,7 +200,9 @@ impl Drop for Lease {
 
 impl Metrics {
     fn inc_down(counter: &std::sync::atomic::AtomicU64) {
-        let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)));
+        let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            Some(v.saturating_sub(1))
+        });
     }
 }
 
@@ -187,7 +213,12 @@ struct WaiterGuard<'a> {
 
 impl Drop for WaiterGuard<'_> {
     fn drop(&mut self) {
-        self.scheduler.state.lock().expect("scheduler").waiters.retain(|w| w.id != self.id);
+        self.scheduler
+            .state
+            .lock()
+            .expect("scheduler")
+            .waiters
+            .retain(|w| w.id != self.id);
         self.scheduler.changed.notify_waiters();
     }
 }
@@ -200,7 +231,12 @@ struct DrainGuard<'a> {
 impl Drop for DrainGuard<'_> {
     fn drop(&mut self) {
         if let Some(model) = self.model.take() {
-            self.scheduler.state.lock().expect("scheduler").draining.remove(&model);
+            self.scheduler
+                .state
+                .lock()
+                .expect("scheduler")
+                .draining
+                .remove(&model);
             self.scheduler.changed.notify_waiters();
         }
     }
@@ -211,7 +247,12 @@ fn cancelled() -> Error {
 }
 
 impl Scheduler {
-    pub fn new(backend: Arc<dyn Backend>, max_loaded: u32, idle_secs: i64, metrics: Arc<Metrics>) -> Arc<Scheduler> {
+    pub fn new(
+        backend: Arc<dyn Backend>,
+        max_loaded: u32,
+        idle_secs: i64,
+        metrics: Arc<Metrics>,
+    ) -> Arc<Scheduler> {
         Arc::new(Scheduler {
             backend,
             state: Mutex::new(State::default()),
@@ -248,10 +289,19 @@ impl Scheduler {
             let mut state = self.state.lock().expect("scheduler");
             state.next += 1;
             let id = state.next;
-            state.waiters.push(Waiter { id, model: model.into(), client: client.into(), priority, since: started });
+            state.waiters.push(Waiter {
+                id,
+                model: model.into(),
+                client: client.into(),
+                priority,
+                since: started,
+            });
             id
         };
-        let guard = WaiterGuard { scheduler: self, id };
+        let guard = WaiterGuard {
+            scheduler: self,
+            id,
+        };
         let mut announced: Option<usize> = None;
         let mut load_time = None;
         loop {
@@ -297,7 +347,11 @@ impl Scheduler {
             match position {
                 None => {
                     if let Some(tx) = events {
-                        let _ = tx.send(Event::ModelLoading { model: model.into() }).await;
+                        let _ = tx
+                            .send(Event::ModelLoading {
+                                model: model.into(),
+                            })
+                            .await;
                     }
                     let begun = Instant::now();
                     match self.load(model, priority, cancel).await {
@@ -326,7 +380,12 @@ impl Scheduler {
     /// Load `model` unless it's loaded. The load goes on when `cancel` fires
     /// (others may be waiting for it, and the worker is loading it anyway).
     /// Returns whether this call loaded it.
-    pub async fn load(self: &Arc<Self>, model: &str, priority: Priority, cancel: &CancellationToken) -> Result<bool, Error> {
+    pub async fn load(
+        self: &Arc<Self>,
+        model: &str,
+        priority: Priority,
+        cancel: &CancellationToken,
+    ) -> Result<bool, Error> {
         let me = self.clone();
         let owned = model.to_string();
         let task = tokio::spawn(async move { me.ensure_loaded(&owned, priority).await });
@@ -342,7 +401,10 @@ impl Scheduler {
         if self.state.lock().expect("scheduler").loaded(model) {
             return Ok(false);
         }
-        let mut drain = DrainGuard { scheduler: self, model: None };
+        let mut drain = DrainGuard {
+            scheduler: self,
+            model: None,
+        };
         let waited = Instant::now();
         loop {
             enum Step {
@@ -355,12 +417,18 @@ impl Scheduler {
             notified.as_mut().enable();
             let step = {
                 let state = self.state.lock().expect("scheduler");
-                let others: Vec<(&String, &Slot)> =
-                    state.models.iter().filter(|(id, s)| *id != model && matches!(s.load, Load::Loaded | Load::Loading)).collect();
+                let others: Vec<(&String, &Slot)> = state
+                    .models
+                    .iter()
+                    .filter(|(id, s)| {
+                        *id != model && matches!(s.load, Load::Loaded | Load::Loading)
+                    })
+                    .collect();
                 let used: u64 = others.iter().map(|(_, s)| s.estimate).sum();
                 let need = self.backend.estimate(model);
                 let (budget, _) = self.backend.memory();
-                let over = others.len() as u32 >= self.max_loaded.load(Ordering::SeqCst) || (budget > 0 && used + need > budget);
+                let over = others.len() as u32 >= self.max_loaded.load(Ordering::SeqCst)
+                    || (budget > 0 && used + need > budget);
                 if !over || others.is_empty() {
                     Step::Go
                 } else if let Some(victim) = state.victim(model) {
@@ -386,10 +454,19 @@ impl Scheduler {
                 }
                 Step::Wait(busy) => {
                     if waited.elapsed() > LOAD_WAIT {
-                        return Err(Error::new(ErrorKind::ResourceExhausted, "other models stayed busy; try again when they're done"));
+                        return Err(Error::new(
+                            ErrorKind::ResourceExhausted,
+                            "other models stayed busy; try again when they're done",
+                        ));
                     }
-                    if priority != Priority::Background && drain.model.as_deref() != Some(busy.as_str()) {
-                        self.state.lock().expect("scheduler").draining.insert(busy.clone());
+                    if priority != Priority::Background
+                        && drain.model.as_deref() != Some(busy.as_str())
+                    {
+                        self.state
+                            .lock()
+                            .expect("scheduler")
+                            .draining
+                            .insert(busy.clone());
                         drain.model = Some(busy);
                     }
                     tokio::select! {
@@ -405,7 +482,11 @@ impl Scheduler {
         if total > 0 && weights > total {
             return Err(Error::new(
                 ErrorKind::ResourceExhausted,
-                format!("the model needs {} GB and this computer has {} GB of memory", weights / 1_000_000_000 + 1, total / 1_000_000_000),
+                format!(
+                    "the model needs {} GB and this computer has {} GB of memory",
+                    weights / 1_000_000_000 + 1,
+                    total / 1_000_000_000
+                ),
             ));
         }
         {
@@ -453,7 +534,11 @@ impl Scheduler {
         {
             let mut state = self.state.lock().expect("scheduler");
             let slot = state.slot(model);
-            slot.load = if result.is_ok() { Load::Unloaded } else { Load::Loaded };
+            slot.load = if result.is_ok() {
+                Load::Unloaded
+            } else {
+                Load::Loaded
+            };
             if result.is_ok() {
                 slot.pending = false;
             }
@@ -464,7 +549,12 @@ impl Scheduler {
 
     /// Keep `model` loaded for `client` until [`Scheduler::release`].
     pub fn pin(&self, model: &str, client: &str) {
-        self.state.lock().expect("scheduler").slot(model).pins.insert(client.into());
+        self.state
+            .lock()
+            .expect("scheduler")
+            .slot(model)
+            .pins
+            .insert(client.into());
     }
 
     /// Drop `client`'s pin and unload the model if nothing else needs it.
@@ -487,7 +577,11 @@ impl Scheduler {
         let _load = self.load_lock.lock().await;
         let still = {
             let state = self.state.lock().expect("scheduler");
-            state.models.get(model).is_some_and(|s| s.load == Load::Loaded && s.active == 0 && s.pins.is_empty()) && !state.waiting_for(model)
+            state
+                .models
+                .get(model)
+                .is_some_and(|s| s.load == Load::Loaded && s.active == 0 && s.pins.is_empty())
+                && !state.waiting_for(model)
         };
         if still {
             self.unload_now(model).await?;
@@ -523,24 +617,42 @@ impl Scheduler {
 
     /// Unload idle models past the idle time, and one more under memory pressure.
     pub async fn tick(&self, pressure: bool) {
-        let Ok(_load) = self.load_lock.try_lock() else { return };
+        let Ok(_load) = self.load_lock.try_lock() else {
+            return;
+        };
         let idle = self.idle_secs.load(Ordering::SeqCst);
         let (expired, extra) = {
             let state = self.state.lock().expect("scheduler");
             let free: Vec<(&String, &Slot)> = state
                 .models
                 .iter()
-                .filter(|(id, s)| s.load == Load::Loaded && s.active == 0 && s.pins.is_empty() && !state.waiting_for(id))
+                .filter(|(id, s)| {
+                    s.load == Load::Loaded
+                        && s.active == 0
+                        && s.pins.is_empty()
+                        && !state.waiting_for(id)
+                })
                 .collect();
             let expired: Vec<String> = free
                 .iter()
-                .filter(|(_, s)| idle >= 0 && s.last_used.elapsed() >= Duration::from_secs(idle as u64))
+                .filter(|(_, s)| {
+                    idle >= 0 && s.last_used.elapsed() >= Duration::from_secs(idle as u64)
+                })
                 .map(|(id, _)| (*id).clone())
                 .collect();
-            let extra = if pressure { free.iter().min_by_key(|(_, s)| s.last_used).map(|(id, _)| (*id).clone()) } else { None };
+            let extra = if pressure {
+                free.iter()
+                    .min_by_key(|(_, s)| s.last_used)
+                    .map(|(id, _)| (*id).clone())
+            } else {
+                None
+            };
             (expired, extra)
         };
-        for model in expired.iter().chain(extra.iter().filter(|m| !expired.contains(m))) {
+        for model in expired
+            .iter()
+            .chain(extra.iter().filter(|m| !expired.contains(m)))
+        {
             tracing::info!(%model, pressure, "unloading idle model");
             if self.unload_now(model).await.is_ok() {
                 Metrics::inc(&self.metrics.idle_unloads);
@@ -572,7 +684,10 @@ impl Scheduler {
 
     pub fn view(&self, model: &str) -> Option<(Load, usize, bool, bool)> {
         let state = self.state.lock().expect("scheduler");
-        state.models.get(model).map(|s| (s.load, s.active, !s.pins.is_empty(), s.pending))
+        state
+            .models
+            .get(model)
+            .map(|s| (s.load, s.active, !s.pins.is_empty(), s.pending))
     }
 
     pub fn queued(&self) -> usize {
@@ -592,7 +707,11 @@ impl Scheduler {
                 active: s.active,
                 slots: s.slots,
                 pinned_by: s.pins.iter().cloned().collect(),
-                idle_secs: if s.active == 0 { s.last_used.elapsed().as_secs() } else { 0 },
+                idle_secs: if s.active == 0 {
+                    s.last_used.elapsed().as_secs()
+                } else {
+                    0
+                },
             })
             .collect();
         out.sort_by(|a, b| a.id.cmp(&b.id));
@@ -619,7 +738,11 @@ mod tests {
             let slots = self.slots.load(Ordering::SeqCst).max(1);
             Box::pin(async move {
                 tokio::time::sleep(Duration::from_millis(5)).await;
-                if model == "broken" { Err(Error::new(ErrorKind::ModelLoadFailed, "nope")) } else { Ok(slots) }
+                if model == "broken" {
+                    Err(Error::new(ErrorKind::ModelLoadFailed, "nope"))
+                } else {
+                    Ok(slots)
+                }
             })
         }
         fn unload(&self, model: String) -> BoxFuture<'static, Result<(), Error>> {
@@ -638,13 +761,25 @@ mod tests {
     }
 
     fn setup(max: u32, slots: usize) -> (Arc<Scheduler>, Arc<Fake>) {
-        let fake = Arc::new(Fake { budget: 1_000, ..Default::default() });
+        let fake = Arc::new(Fake {
+            budget: 1_000,
+            ..Default::default()
+        });
         fake.slots.store(slots, Ordering::SeqCst);
-        (Scheduler::new(fake.clone(), max, 60, Arc::new(Metrics::default())), fake)
+        (
+            Scheduler::new(fake.clone(), max, 60, Arc::new(Metrics::default())),
+            fake,
+        )
     }
 
-    async fn lease(s: &Arc<Scheduler>, model: &str, client: &str, p: Priority) -> Result<Lease, Error> {
-        s.acquire(model, client, p, &CancellationToken::new(), None).await
+    async fn lease(
+        s: &Arc<Scheduler>,
+        model: &str,
+        client: &str,
+        p: Priority,
+    ) -> Result<Lease, Error> {
+        s.acquire(model, client, p, &CancellationToken::new(), None)
+            .await
     }
 
     #[tokio::test]
@@ -665,12 +800,23 @@ mod tests {
         let (s, fake) = setup(1, 1);
         let a = lease(&s, "a", "chat", Priority::Normal).await.unwrap();
         let s2 = s.clone();
-        let other = tokio::spawn(async move { lease(&s2, "b", "glimpse", Priority::Normal).await.map(|_| ()) });
+        let other = tokio::spawn(async move {
+            lease(&s2, "b", "glimpse", Priority::Normal)
+                .await
+                .map(|_| ())
+        });
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(fake.unloads.lock().unwrap().is_empty());
         // While b waits to load, a takes no new requests.
         let s3 = s.clone();
-        let blocked = tokio::spawn(async move { tokio::time::timeout(Duration::from_millis(150), lease(&s3, "a", "chat", Priority::Normal)).await.is_err() });
+        let blocked = tokio::spawn(async move {
+            tokio::time::timeout(
+                Duration::from_millis(150),
+                lease(&s3, "a", "chat", Priority::Normal),
+            )
+            .await
+            .is_err()
+        });
         assert!(blocked.await.unwrap());
         drop(a);
         other.await.unwrap().unwrap();
@@ -683,7 +829,11 @@ mod tests {
         let first = lease(&s, "a", "x", Priority::Normal).await.unwrap();
         let order = Arc::new(Mutex::new(Vec::new()));
         let mut tasks = Vec::new();
-        for (name, p) in [("background", Priority::Background), ("normal", Priority::Normal), ("interactive", Priority::Interactive)] {
+        for (name, p) in [
+            ("background", Priority::Background),
+            ("normal", Priority::Normal),
+            ("interactive", Priority::Interactive),
+        ] {
             let (s, order) = (s.clone(), order.clone());
             tasks.push(tokio::spawn(async move {
                 let l = lease(&s, "a", name, p).await.unwrap();
@@ -697,13 +847,22 @@ mod tests {
         for t in tasks {
             t.await.unwrap();
         }
-        assert_eq!(*order.lock().unwrap(), ["interactive", "normal", "background"]);
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["interactive", "normal", "background"]
+        );
     }
 
     #[test]
     fn aging_lifts_background_work() {
         let now = Instant::now();
-        let w = Waiter { id: 1, model: "a".into(), client: "c".into(), priority: Priority::Background, since: now - AGE_STEP * 2 };
+        let w = Waiter {
+            id: 1,
+            model: "a".into(),
+            client: "c".into(),
+            priority: Priority::Background,
+            since: now - AGE_STEP * 2,
+        };
         assert_eq!(w.effective(now), 2);
         let fresh = Waiter { since: now, ..w };
         assert_eq!(fresh.effective(now), 0);
@@ -723,15 +882,36 @@ mod tests {
         let cancel = CancellationToken::new();
         let s2 = s.clone();
         let c2 = cancel.clone();
-        let waiting = tokio::spawn(async move { s2.acquire("b", "y", Priority::Normal, &c2, None).await.map(|_| ()) });
+        let waiting = tokio::spawn(async move {
+            s2.acquire("b", "y", Priority::Normal, &c2, None)
+                .await
+                .map(|_| ())
+        });
         tokio::time::sleep(Duration::from_millis(50)).await;
         cancel.cancel();
-        assert_eq!(waiting.await.unwrap().unwrap_err().kind, ErrorKind::Cancelled);
+        assert_eq!(
+            waiting.await.unwrap().unwrap_err().kind,
+            ErrorKind::Cancelled
+        );
         assert_eq!(s.queued(), 0);
         drop(held);
 
-        assert_eq!(lease(&s, "broken", "x", Priority::Normal).await.err().unwrap().kind, ErrorKind::ModelLoadFailed);
-        assert_eq!(lease(&s, "huge", "x", Priority::Normal).await.err().unwrap().kind, ErrorKind::ResourceExhausted);
+        assert_eq!(
+            lease(&s, "broken", "x", Priority::Normal)
+                .await
+                .err()
+                .unwrap()
+                .kind,
+            ErrorKind::ModelLoadFailed
+        );
+        assert_eq!(
+            lease(&s, "huge", "x", Priority::Normal)
+                .await
+                .err()
+                .unwrap()
+                .kind,
+            ErrorKind::ResourceExhausted
+        );
     }
 
     #[tokio::test]
@@ -740,10 +920,17 @@ mod tests {
         let cancel = CancellationToken::new();
         let s2 = s.clone();
         let c2 = cancel.clone();
-        let waiting = tokio::spawn(async move { s2.acquire("a", "x", Priority::Normal, &c2, None).await.map(|_| ()) });
+        let waiting = tokio::spawn(async move {
+            s2.acquire("a", "x", Priority::Normal, &c2, None)
+                .await
+                .map(|_| ())
+        });
         tokio::time::sleep(Duration::from_millis(1)).await;
         cancel.cancel();
-        assert_eq!(waiting.await.unwrap().unwrap_err().kind, ErrorKind::Cancelled);
+        assert_eq!(
+            waiting.await.unwrap().unwrap_err().kind,
+            ErrorKind::Cancelled
+        );
         tokio::time::sleep(Duration::from_millis(30)).await;
         assert_eq!(s.view("a").unwrap().0, Load::Loaded);
         drop(lease(&s, "b", "y", Priority::Normal).await.unwrap());

@@ -35,7 +35,10 @@ pub fn snapshot_projector(model: &Path) -> Option<PathBuf> {
         .ok()?
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.to_str().is_some_and(|s| sidecar_kind(s) == Some("mmproj")));
+        .filter(|p| {
+            p.to_str()
+                .is_some_and(|s| sidecar_kind(s) == Some("mmproj"))
+        });
     let first = found.next()?;
     found.next().is_none().then_some(first)
 }
@@ -53,12 +56,17 @@ pub fn valid_repo(repo: &str) -> bool {
             !part.is_empty()
                 && *part != "."
                 && *part != ".."
-                && part.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
+                && part
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_' | b'.'))
         })
 }
 
 pub fn valid_file(path: &str) -> bool {
-    !path.is_empty() && Path::new(path).components().all(|part| matches!(part, Component::Normal(_)))
+    !path.is_empty()
+        && Path::new(path)
+            .components()
+            .all(|part| matches!(part, Component::Normal(_)))
 }
 
 pub fn valid_oid(oid: &str) -> bool {
@@ -73,21 +81,30 @@ pub fn repo_dir(cache: &Path, repo: &str) -> PathBuf {
 pub fn revision_of(path: &Path) -> Option<String> {
     let mut parts = path.components().map(|c| c.as_os_str().to_string_lossy());
     parts.by_ref().find(|p| p == "snapshots")?;
-    parts.next().map(|p| p.into_owned()).filter(|p| !p.is_empty())
+    parts
+        .next()
+        .map(|p| p.into_owned())
+        .filter(|p| !p.is_empty())
 }
 
 /// A cached quant can exist even when it contains only a speculative drafter.
 pub fn cached_auxiliary_model(cache: &Path, model: &str) -> bool {
-    let Some((repo, quant)) = model.rsplit_once(':') else { return false };
+    let Some((repo, quant)) = model.rsplit_once(':') else {
+        return false;
+    };
     if !valid_repo(repo) {
         return false;
     }
     let base = repo_dir(cache, repo);
-    let Ok(revision) = std::fs::read_to_string(base.join("refs/main")) else { return false };
+    let Ok(revision) = std::fs::read_to_string(base.join("refs/main")) else {
+        return false;
+    };
     let mut dirs = vec![base.join("snapshots").join(revision.trim())];
     let (mut auxiliary, mut main) = (false, false);
     while let Some(dir) = dirs.pop() {
-        let Ok(entries) = std::fs::read_dir(dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -125,7 +142,11 @@ pub fn cached_file(cache: &Path, model: &str) -> Option<PathBuf> {
     let base = repo_dir(cache, repo);
     let snapshot = match std::fs::read_to_string(base.join("refs/main")) {
         Ok(rev) => base.join("snapshots").join(rev.trim()),
-        Err(_) => std::fs::read_dir(base.join("snapshots")).ok()?.flatten().map(|e| e.path()).next()?,
+        Err(_) => std::fs::read_dir(base.join("snapshots"))
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .next()?,
     };
     let mut files = Vec::new();
     let mut dirs = vec![snapshot.clone()];
@@ -136,8 +157,14 @@ pub fn cached_file(cache: &Path, model: &str) -> Option<PathBuf> {
                 dirs.push(path);
                 continue;
             }
-            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
-            if !name.to_ascii_lowercase().ends_with(".gguf") || name.to_ascii_lowercase().contains("mmproj") {
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            if !name.to_ascii_lowercase().ends_with(".gguf")
+                || name.to_ascii_lowercase().contains("mmproj")
+            {
                 continue;
             }
             if let Some(pos) = name.find("-of-")
@@ -145,15 +172,29 @@ pub fn cached_file(cache: &Path, model: &str) -> Option<PathBuf> {
             {
                 continue;
             }
-            files.push((path.strip_prefix(&snapshot).map(|p| p.display().to_string()).unwrap_or(name), path));
+            files.push((
+                path.strip_prefix(&snapshot)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or(name),
+                path,
+            ));
         }
     }
     let tag = tag.to_ascii_uppercase();
-    let pick = |matches: &dyn Fn(&str) -> bool| files.iter().filter(|(rel, _)| matches(rel)).min_by_key(|(rel, _)| rel.len()).map(|(_, p)| p.clone());
+    let pick = |matches: &dyn Fn(&str) -> bool| {
+        files
+            .iter()
+            .filter(|(rel, _)| matches(rel))
+            .min_by_key(|(rel, _)| rel.len())
+            .map(|(_, p)| p.clone())
+    };
     pick(&|rel| quant_tag(rel) == tag && !auxiliary_gguf(rel))
         .or_else(|| pick(&|rel| router_tag(rel.rsplit('/').next().unwrap_or(rel)) == tag))
         .or_else(|| {
-            let main: Vec<_> = files.iter().filter(|(rel, _)| !auxiliary_gguf(rel)).collect();
+            let main: Vec<_> = files
+                .iter()
+                .filter(|(rel, _)| !auxiliary_gguf(rel))
+                .collect();
             (main.len() == 1).then(|| main[0].1.clone())
         })
 }
@@ -179,7 +220,10 @@ pub fn quant_tag(filename: &str) -> String {
     }
     match best {
         Some((start, len)) => upper[start..start + len].to_string(),
-        None => base.trim_end_matches(".gguf").trim_end_matches(".GGUF").to_string(),
+        None => base
+            .trim_end_matches(".gguf")
+            .trim_end_matches(".GGUF")
+            .to_string(),
     }
 }
 
@@ -247,21 +291,41 @@ pub fn token(config_home: &Path) -> Option<String> {
                 .join("huggingface")
         })
         .join("token");
-    if let Some(t) = std::env::var("HF_TOKEN").ok().filter(|t| !t.trim().is_empty()) {
+    if let Some(t) = std::env::var("HF_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+    {
         return Some(t.trim().into());
     }
-    [config_home.join("nyx-ai/huggingface.token"), config_home.join("nyx-chat/huggingface.token"), shared]
-        .into_iter()
-        .find_map(|p| std::fs::read_to_string(p).ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+    [
+        config_home.join("nyx-ai/huggingface.token"),
+        config_home.join("nyx-chat/huggingface.token"),
+        shared,
+    ]
+    .into_iter()
+    .find_map(|p| {
+        std::fs::read_to_string(p)
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })
 }
 
 /// `HF_ENDPOINT`, else huggingface.co.
 pub fn endpoint() -> String {
-    std::env::var("HF_ENDPOINT").ok().filter(|e| !e.is_empty()).unwrap_or_else(|| "https://huggingface.co".into()).trim_end_matches('/').to_string()
+    std::env::var("HF_ENDPOINT")
+        .ok()
+        .filter(|e| !e.is_empty())
+        .unwrap_or_else(|| "https://huggingface.co".into())
+        .trim_end_matches('/')
+        .to_string()
 }
 
 pub fn encode_path(path: &str) -> String {
-    path.split('/').map(crate::worker::encode_query).collect::<Vec<_>>().join("/")
+    path.split('/')
+        .map(crate::worker::encode_query)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 #[cfg(test)]
@@ -277,7 +341,10 @@ mod tests {
         assert_eq!(quant_tag("Ternary-Bonsai-2-27B-PQ2_0.gguf"), "PQ2_0");
         assert_eq!(quant_tag("Ternary-Bonsai-2-27B-PTQ1_0.gguf"), "PTQ1_0");
         assert!(auxiliary_gguf("Ternary-Bonsai-2-9B-DFlash2-Q8_0.gguf"));
-        assert_eq!(sidecar_kind("Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf"), Some("mtp"));
+        assert_eq!(
+            sidecar_kind("Ternary-Bonsai-2-9B-PQ2_0-MTP-Q8_0.gguf"),
+            Some("mtp")
+        );
         assert_eq!(sidecar_kind("Swift-IQ3_S-mtp.gguf"), Some("mtp"));
         assert_eq!(sidecar_kind("gemma-4-E4B-it-mmproj.gguf"), Some("mmproj"));
         assert_eq!(sidecar_kind("smtpserver-Q4_0.gguf"), None);
@@ -307,14 +374,31 @@ mod tests {
                 std::fs::write(p, b"x").unwrap();
             }
         };
-        snap("g/gemma", &["gemma-4-E4B-it-mmproj.gguf", "gemma-4-E4B_q4_0-it.gguf"]);
+        snap(
+            "g/gemma",
+            &["gemma-4-E4B-it-mmproj.gguf", "gemma-4-E4B_q4_0-it.gguf"],
+        );
         snap("u/swift", &["Swift-IQ3_S.gguf", "Swift-IQ3_S-mtp.gguf"]);
-        snap("s/split", &["Q8_0/big-Q8_0-00001-of-00002.gguf", "Q8_0/big-Q8_0-00002-of-00002.gguf"]);
-        let name = |m: &str| cached_file(dir.path(), m).map(|p| p.file_name().unwrap().to_string_lossy().to_string());
-        assert_eq!(name("g/gemma:IT").as_deref(), Some("gemma-4-E4B_q4_0-it.gguf"));
+        snap(
+            "s/split",
+            &[
+                "Q8_0/big-Q8_0-00001-of-00002.gguf",
+                "Q8_0/big-Q8_0-00002-of-00002.gguf",
+            ],
+        );
+        let name = |m: &str| {
+            cached_file(dir.path(), m).map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+        };
+        assert_eq!(
+            name("g/gemma:IT").as_deref(),
+            Some("gemma-4-E4B_q4_0-it.gguf")
+        );
         assert_eq!(name("u/swift:IQ3_S").as_deref(), Some("Swift-IQ3_S.gguf"));
         assert_eq!(name("u/swift:MTP").as_deref(), Some("Swift-IQ3_S-mtp.gguf"));
-        assert_eq!(name("s/split:Q8_0").as_deref(), Some("big-Q8_0-00001-of-00002.gguf"));
+        assert_eq!(
+            name("s/split:Q8_0").as_deref(),
+            Some("big-Q8_0-00001-of-00002.gguf")
+        );
         assert_eq!(name("s/none:Q8_0"), None);
     }
 }

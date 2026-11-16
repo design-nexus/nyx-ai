@@ -46,9 +46,14 @@ fn bad(what: impl Into<String>) -> Invalid {
 /// Whether a file starts like a GGUF file, for a quick check before loading.
 pub fn looks_like_gguf(path: &Path) -> bool {
     let mut magic = [0u8; 8];
-    std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut magic)).is_ok()
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut magic))
+        .is_ok()
         && &magic[..4] == b"GGUF"
-        && matches!(u32::from_le_bytes([magic[4], magic[5], magic[6], magic[7]]), 2 | 3)
+        && matches!(
+            u32::from_le_bytes([magic[4], magic[5], magic[6], magic[7]]),
+            2 | 3
+        )
 }
 
 pub fn read(path: &Path) -> Result<Meta, Invalid> {
@@ -63,7 +68,9 @@ struct Reader<'a, R: Read> {
 impl<R: Read> Reader<'_, R> {
     fn bytes<const N: usize>(&mut self) -> Result<[u8; N], Invalid> {
         let mut buf = [0u8; N];
-        self.input.read_exact(&mut buf).map_err(|_| bad("truncated header"))?;
+        self.input
+            .read_exact(&mut buf)
+            .map_err(|_| bad("truncated header"))?;
         Ok(buf)
     }
 
@@ -81,13 +88,20 @@ impl<R: Read> Reader<'_, R> {
             return Err(bad("string too long"));
         }
         let mut buf = vec![0u8; len as usize];
-        self.input.read_exact(&mut buf).map_err(|_| bad("truncated string"))?;
+        self.input
+            .read_exact(&mut buf)
+            .map_err(|_| bad("truncated string"))?;
         Ok(String::from_utf8_lossy(&buf).into_owned())
     }
 
     fn skip(&mut self, n: u64) -> Result<(), Invalid> {
-        let copied = std::io::copy(&mut (&mut *self.input).take(n), &mut std::io::sink()).map_err(|_| bad("truncated value"))?;
-        if copied == n { Ok(()) } else { Err(bad("truncated value")) }
+        let copied = std::io::copy(&mut (&mut *self.input).take(n), &mut std::io::sink())
+            .map_err(|_| bad("truncated value"))?;
+        if copied == n {
+            Ok(())
+        } else {
+            Err(bad("truncated value"))
+        }
     }
 
     fn value(&mut self, kind: u32) -> Result<Value, Invalid> {
@@ -104,7 +118,10 @@ impl<R: Read> Reader<'_, R> {
                 let item = self.u32()?;
                 let count = self.u64()?;
                 match fixed_size(item) {
-                    Some(size) => self.skip(size.checked_mul(count).ok_or_else(|| bad("array too long"))?)?,
+                    Some(size) => self.skip(
+                        size.checked_mul(count)
+                            .ok_or_else(|| bad("array too long"))?,
+                    )?,
                     None if item == 8 => {
                         for _ in 0..count {
                             let len = self.u64()?;
@@ -162,7 +179,10 @@ pub fn parse<R: Read>(input: &mut R) -> Result<Meta, Invalid> {
     if count > MAX_KV {
         return Err(bad("too many metadata keys"));
     }
-    let mut meta = Meta { version, ..Default::default() };
+    let mut meta = Meta {
+        version,
+        ..Default::default()
+    };
     let mut by_arch: Vec<(String, Value)> = Vec::new();
     for _ in 0..count {
         let key = r.string()?;
@@ -199,7 +219,9 @@ pub fn parse<R: Read>(input: &mut R) -> Result<Meta, Invalid> {
     }
     if let Some(arch) = meta.architecture.clone() {
         for (key, value) in by_arch {
-            let Some(field) = key.strip_prefix(&arch).and_then(|k| k.strip_prefix('.')) else { continue };
+            let Some(field) = key.strip_prefix(&arch).and_then(|k| k.strip_prefix('.')) else {
+                continue;
+            };
             match (field, value) {
                 ("context_length", Value::Int(n)) => meta.context_length = Some(n as u64),
                 ("embedding_length", Value::Int(n)) => meta.embedding_length = Some(n as u64),
@@ -220,7 +242,8 @@ impl Meta {
 
     /// Pools token states into one vector (mean, cls or last).
     pub fn embedding(&self) -> bool {
-        matches!(self.pooling_type, Some(1..=3)) || (self.causal_attention == Some(false) && self.chat_template.is_none())
+        matches!(self.pooling_type, Some(1..=3))
+            || (self.causal_attention == Some(false) && self.chat_template.is_none())
     }
 
     pub fn chat(&self) -> bool {
@@ -229,13 +252,23 @@ impl Meta {
 
     /// The template takes a tool list.
     pub fn tools(&self) -> bool {
-        self.chat_template.as_deref().is_some_and(|t| t.contains("tools"))
+        self.chat_template
+            .as_deref()
+            .is_some_and(|t| t.contains("tools"))
     }
 
     /// The template has a reasoning section or switch.
     pub fn thinking(&self) -> bool {
         self.chat_template.as_deref().is_some_and(|t| {
-            ["enable_thinking", "<think>", "reasoning_content", "<|channel>thought", "thinking"].iter().any(|m| t.contains(m))
+            [
+                "enable_thinking",
+                "<think>",
+                "reasoning_content",
+                "<|channel>thought",
+                "thinking",
+            ]
+            .iter()
+            .any(|m| t.contains(m))
         })
     }
 
@@ -334,9 +367,15 @@ pub(crate) mod tests {
             ("general.architecture", TestValue::Str("gemma4")),
             ("general.name", TestValue::Str("Gemma 4")),
             ("general.file_type", TestValue::U32(15)),
-            ("tokenizer.ggml.tokens", TestValue::Strings(&["a", "b", "c"])),
+            (
+                "tokenizer.ggml.tokens",
+                TestValue::Strings(&["a", "b", "c"]),
+            ),
             ("gemma4.context_length", TestValue::U32(131072)),
-            ("tokenizer.chat_template", TestValue::Str("{% if tools %}{{ enable_thinking }}{% endif %}")),
+            (
+                "tokenizer.chat_template",
+                TestValue::Str("{% if tools %}{{ enable_thinking }}{% endif %}"),
+            ),
         ])
     }
 
@@ -360,7 +399,10 @@ pub(crate) mod tests {
         let meta = parse(&mut embed.as_slice()).unwrap();
         assert!(meta.embedding() && !meta.chat());
         assert_eq!(meta.embedding_length, Some(768));
-        let clip = build(&[("general.architecture", TestValue::Str("clip")), ("clip.has_vision_encoder", TestValue::Bool(true))]);
+        let clip = build(&[
+            ("general.architecture", TestValue::Str("clip")),
+            ("clip.has_vision_encoder", TestValue::Bool(true)),
+        ]);
         let meta = parse(&mut clip.as_slice()).unwrap();
         assert!(meta.projector() && meta.vision_encoder);
     }

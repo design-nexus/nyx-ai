@@ -17,7 +17,9 @@ use tokio_util::sync::CancellationToken;
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
         .without_time()
         .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stderr()))
         .with_target(false)
@@ -29,8 +31,12 @@ fn main() -> ExitCode {
     let paths = Paths::from_env();
     let options = Options {
         allow_untrusted: std::env::var("NYX_AI_ALLOW_UNTRUSTED").is_ok_and(|v| v == "1"),
-        worker: std::env::var_os("NYX_AI_WORKER").filter(|v| !v.is_empty()).map(Into::into),
-        power_supply: std::env::var_os("NYX_AI_POWER_SUPPLY").filter(|v| !v.is_empty()).map(Into::into),
+        worker: std::env::var_os("NYX_AI_WORKER")
+            .filter(|v| !v.is_empty())
+            .map(Into::into),
+        power_supply: std::env::var_os("NYX_AI_POWER_SUPPLY")
+            .filter(|v| !v.is_empty())
+            .map(Into::into),
         hf_endpoint: None,
         update_idle_secs: None,
         socket_units: std::env::var_os("NYX_AI_SOCKET").is_none(),
@@ -42,7 +48,10 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
         Ok(runtime) => runtime,
         Err(e) => {
             tracing::error!(error = %e, "no runtime");
@@ -56,7 +65,10 @@ fn main() -> ExitCode {
         let server = tokio::spawn(server::serve(service.clone(), listeners.unix, stop.clone()));
         service.start_openai(&stop, listeners.tcp);
         tracing::info!(socket = %service.paths().socket.display(), "Nyx AI Core ready");
-        let (Ok(mut term), Ok(mut int)) = (signal(SignalKind::terminate()), signal(SignalKind::interrupt())) else {
+        let (Ok(mut term), Ok(mut int)) = (
+            signal(SignalKind::terminate()),
+            signal(SignalKind::interrupt()),
+        ) else {
             tracing::error!("can't watch signals");
             return ExitCode::FAILURE;
         };

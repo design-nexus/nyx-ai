@@ -3,7 +3,8 @@
 
 use crate::service::{Caller, Service};
 use nyx_ai_proto::{
-    API_VERSION, ClientLine, Error, ErrorKind, Event, MAX_LINE, Op, Reply, Request, ServerLine, Welcome, decode_client_line, encode,
+    API_VERSION, ClientLine, Error, ErrorKind, Event, MAX_LINE, Op, Reply, Request, ServerLine,
+    Welcome, decode_client_line, encode,
 };
 use std::collections::HashMap;
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -29,8 +30,14 @@ pub struct Listeners {
 /// The sockets systemd passed (socket activation), or a new Unix socket at
 /// `path`. Call before starting threads: it clears systemd's variables.
 pub fn listen(path: &Path) -> std::io::Result<Listeners> {
-    let ours = std::env::var("LISTEN_PID").ok().and_then(|p| p.parse::<u32>().ok()) == Some(std::process::id());
-    let count = std::env::var("LISTEN_FDS").ok().and_then(|n| n.parse::<i32>().ok()).unwrap_or(0);
+    let ours = std::env::var("LISTEN_PID")
+        .ok()
+        .and_then(|p| p.parse::<u32>().ok())
+        == Some(std::process::id());
+    let count = std::env::var("LISTEN_FDS")
+        .ok()
+        .and_then(|n| n.parse::<i32>().ok())
+        .unwrap_or(0);
     // SAFETY: these variables are only read here, before any other thread looks at them.
     unsafe {
         std::env::remove_var("LISTEN_PID");
@@ -48,15 +55,20 @@ pub fn listen(path: &Path) -> std::io::Result<Listeners> {
             let family = unsafe {
                 let mut addr: libc::sockaddr_storage = std::mem::zeroed();
                 let mut len = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-                if libc::getsockname(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len) != 0 {
+                if libc::getsockname(fd, &mut addr as *mut _ as *mut libc::sockaddr, &mut len) != 0
+                {
                     continue;
                 }
                 addr.ss_family as i32
             };
             // SAFETY: systemd hands these fds to us as listening sockets.
             match family {
-                libc::AF_UNIX if unix.is_none() => unix = Some(unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) }),
-                libc::AF_INET | libc::AF_INET6 if tcp.is_none() => tcp = Some(unsafe { std::net::TcpListener::from_raw_fd(fd) }),
+                libc::AF_UNIX if unix.is_none() => {
+                    unix = Some(unsafe { std::os::unix::net::UnixListener::from_raw_fd(fd) })
+                }
+                libc::AF_INET | libc::AF_INET6 if tcp.is_none() => {
+                    tcp = Some(unsafe { std::net::TcpListener::from_raw_fd(fd) })
+                }
                 _ => {}
             }
         }
@@ -73,10 +85,16 @@ pub fn listen(path: &Path) -> std::io::Result<Listeners> {
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
     if let Ok(meta) = std::fs::symlink_metadata(path) {
         if !meta.file_type().is_socket() {
-            return Err(std::io::Error::other(format!("{} exists and isn't a socket", path.display())));
+            return Err(std::io::Error::other(format!(
+                "{} exists and isn't a socket",
+                path.display()
+            )));
         }
         if std::os::unix::net::UnixStream::connect(path).is_ok() {
-            return Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, "Nyx AI Core is already running"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                "Nyx AI Core is already running",
+            ));
         }
         std::fs::remove_file(path)?;
     }
@@ -87,7 +105,11 @@ pub fn listen(path: &Path) -> std::io::Result<Listeners> {
 }
 
 /// Serve until `stop` is cancelled.
-pub async fn serve(service: Arc<Service>, listener: std::os::unix::net::UnixListener, stop: CancellationToken) {
+pub async fn serve(
+    service: Arc<Service>,
+    listener: std::os::unix::net::UnixListener,
+    stop: CancellationToken,
+) {
     let listener = match UnixListener::from_std(listener) {
         Ok(listener) => listener,
         Err(e) => {
@@ -126,15 +148,36 @@ pub async fn serve(service: Arc<Service>, listener: std::os::unix::net::UnixList
 fn identify(pid: Option<i32>, declared: &str) -> Caller {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let connection = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let declared: String = declared.chars().filter(|c| c.is_ascii_alphanumeric() || "-_.".contains(*c)).take(64).collect();
-    let own = std::env::current_exe().ok().and_then(|e| e.parent().map(Path::to_path_buf));
+    let declared: String = declared
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || "-_.".contains(*c))
+        .take(64)
+        .collect();
+    let own = std::env::current_exe()
+        .ok()
+        .and_then(|e| e.parent().map(Path::to_path_buf));
     let program = pid
         .and_then(|pid| std::fs::read_link(format!("/proc/{pid}/exe")).ok())
         .zip(own)
         .and_then(|(exe, own)| nyx_peer::program(&exe, &own));
     match program {
-        Some(name) => Caller { name, trusted: true, connection },
-        None => Caller { name: format!("untrusted:{}", if declared.is_empty() { "unknown" } else { &declared }), trusted: false, connection },
+        Some(name) => Caller {
+            name,
+            trusted: true,
+            connection,
+        },
+        None => Caller {
+            name: format!(
+                "untrusted:{}",
+                if declared.is_empty() {
+                    "unknown"
+                } else {
+                    &declared
+                }
+            ),
+            trusted: false,
+            connection,
+        },
     }
 }
 
@@ -182,7 +225,10 @@ async fn connection(service: Arc<Service>, stream: UnixStream, stop: Cancellatio
         return;
     }
     let (read, mut write) = stream.into_split();
-    let mut lines = Lines { reader: BufReader::new(read), line: Vec::new() };
+    let mut lines = Lines {
+        reader: BufReader::new(read),
+        line: Vec::new(),
+    };
     let (out, mut outbox) = mpsc::channel::<ServerLine>(64);
     let writer_stop = stop.clone();
     let writer = tokio::spawn(async move {
@@ -196,17 +242,34 @@ async fn connection(service: Arc<Service>, stream: UnixStream, stop: Cancellatio
     });
 
     let hello = tokio::time::timeout(Duration::from_secs(10), lines.next()).await;
-    let caller = match hello.ok().and_then(|r| r.ok()).flatten().map(|l| decode_client_line(&l)) {
+    let caller = match hello
+        .ok()
+        .and_then(|r| r.ok())
+        .flatten()
+        .map(|l| decode_client_line(&l))
+    {
         Some(Ok(ClientLine::Hello(hello))) if hello.api_version == API_VERSION => {
             let caller = identify(cred.pid(), &hello.client);
             let _ = out
-                .send(ServerLine::Hello(Welcome { api_version: API_VERSION, server: env!("CARGO_PKG_VERSION").into(), client: caller.name.clone() }))
+                .send(ServerLine::Hello(Welcome {
+                    api_version: API_VERSION,
+                    server: env!("CARGO_PKG_VERSION").into(),
+                    client: caller.name.clone(),
+                }))
                 .await;
             caller
         }
         Some(Ok(ClientLine::Hello(hello))) => {
-            let message = format!("this Nyx AI Core speaks version {API_VERSION}; the client speaks {}", hello.api_version);
-            let _ = out.send(ServerLine::Error { id: None, error: Error::new(ErrorKind::IncompatibleVersion, message) }).await;
+            let message = format!(
+                "this Nyx AI Core speaks version {API_VERSION}; the client speaks {}",
+                hello.api_version
+            );
+            let _ = out
+                .send(ServerLine::Error {
+                    id: None,
+                    error: Error::new(ErrorKind::IncompatibleVersion, message),
+                })
+                .await;
             drop(out);
             let _ = writer.await;
             return;
@@ -232,14 +295,24 @@ async fn connection(service: Arc<Service>, stream: UnixStream, stop: Cancellatio
             Ok(Some(line)) => line,
             Ok(None) => break,
             Err(e) => {
-                let _ = out.send(ServerLine::Error { id: None, error: Error::new(ErrorKind::InvalidRequest, e.to_string()) }).await;
+                let _ = out
+                    .send(ServerLine::Error {
+                        id: None,
+                        error: Error::new(ErrorKind::InvalidRequest, e.to_string()),
+                    })
+                    .await;
                 break;
             }
         };
         let request = match decode_client_line(&line) {
             Ok(ClientLine::Request(request)) => request,
             Ok(ClientLine::Hello(_)) => {
-                let _ = out.send(ServerLine::Error { id: None, error: Error::new(ErrorKind::InvalidRequest, "already said hello") }).await;
+                let _ = out
+                    .send(ServerLine::Error {
+                        id: None,
+                        error: Error::new(ErrorKind::InvalidRequest, "already said hello"),
+                    })
+                    .await;
                 continue;
             }
             Err((id, error)) => {
@@ -253,9 +326,18 @@ async fn connection(service: Arc<Service>, stream: UnixStream, stop: Cancellatio
             let reply = match token {
                 Some(token) => {
                     token.cancel();
-                    ServerLine::Result { id, result: Reply::Ok }
+                    ServerLine::Result {
+                        id,
+                        result: Reply::Ok,
+                    }
                 }
-                None => ServerLine::Error { id: Some(id), error: Error::new(ErrorKind::UnknownRequest, format!("no open request {request}")) },
+                None => ServerLine::Error {
+                    id: Some(id),
+                    error: Error::new(
+                        ErrorKind::UnknownRequest,
+                        format!("no open request {request}"),
+                    ),
+                },
             };
             let _ = out.send(reply).await;
             continue;
@@ -263,26 +345,42 @@ async fn connection(service: Arc<Service>, stream: UnixStream, stop: Cancellatio
         let refused = {
             let open = open.lock().expect("requests");
             if open.contains_key(&id) {
-                Some(Error::new(ErrorKind::InvalidRequest, format!("request {id} is already open")))
+                Some(Error::new(
+                    ErrorKind::InvalidRequest,
+                    format!("request {id} is already open"),
+                ))
             } else if open.len() >= MAX_REQUESTS {
-                Some(Error::new(ErrorKind::Busy, "too many open requests on this connection"))
+                Some(Error::new(
+                    ErrorKind::Busy,
+                    "too many open requests on this connection",
+                ))
             } else {
                 service.authorize(&caller, &op).err()
             }
         };
         if let Some(error) = refused {
-            let _ = out.send(ServerLine::Error { id: Some(id), error }).await;
+            let _ = out
+                .send(ServerLine::Error {
+                    id: Some(id),
+                    error,
+                })
+                .await;
             continue;
         }
         let token = stop.child_token();
         open.lock().expect("requests").insert(id, token.clone());
-        let (service, caller, out, open) = (service.clone(), caller.clone(), out.clone(), open.clone());
+        let (service, caller, out, open) =
+            (service.clone(), caller.clone(), out.clone(), open.clone());
         tokio::spawn(async move {
             let (events, mut inbox) = mpsc::channel::<Event>(32);
             let forward_out = out.clone();
             let forward = tokio::spawn(async move {
                 while let Some(event) = inbox.recv().await {
-                    if forward_out.send(ServerLine::Event { id, event }).await.is_err() {
+                    if forward_out
+                        .send(ServerLine::Event { id, event })
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -297,7 +395,10 @@ async fn connection(service: Arc<Service>, stream: UnixStream, stop: Cancellatio
                     if error.kind != ErrorKind::Cancelled {
                         tracing::debug!(client = %caller.name, op = name, kind = ?error.kind, "request failed");
                     }
-                    ServerLine::Error { id: Some(id), error }
+                    ServerLine::Error {
+                        id: Some(id),
+                        error,
+                    }
                 }
             };
             let _ = out.send(line).await;

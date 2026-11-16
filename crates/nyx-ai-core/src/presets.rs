@@ -6,7 +6,8 @@ use crate::paths::{self, Paths};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-pub const DEFAULTS: &str = "version = 1\n\n[*]\nctx-size = 8192\nn-gpu-layers = auto\nflash-attn = auto\n";
+pub const DEFAULTS: &str =
+    "version = 1\n\n[*]\nctx-size = 8192\nn-gpu-layers = auto\nflash-attn = auto\n";
 
 /// The settings `configure_model` accepts, by their canonical name.
 pub const KEYS: &[&str] = &[
@@ -65,7 +66,9 @@ pub fn canonical(key: &str) -> &str {
     }
 }
 
-const KV_TYPES: &[&str] = &["f32", "f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4_nl"];
+const KV_TYPES: &[&str] = &[
+    "f32", "f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4_nl",
+];
 
 /// Check one setting; returns the canonical key and normalised value.
 pub fn validate(key: &str, value: &str) -> Result<(String, String), String> {
@@ -90,14 +93,18 @@ pub fn validate(key: &str, value: &str) -> Result<(String, String), String> {
         "flash-attn" if matches!(value, "on" | "off" | "auto") => value.to_string(),
         "flash-attn" => return Err("flash-attn must be on, off or auto".into()),
         "cache-type-k" | "cache-type-v" if KV_TYPES.contains(&value) => value.to_string(),
-        "cache-type-k" | "cache-type-v" => return Err(format!("{key} must be one of {}", KV_TYPES.join(", "))),
+        "cache-type-k" | "cache-type-v" => {
+            return Err(format!("{key} must be one of {}", KV_TYPES.join(", ")));
+        }
         "temp" | "repeat-penalty" => number(0.0, 5.0)?,
         "top-p" | "min-p" => number(0.0, 1.0)?,
         "top-k" => integer(0, 1000)?,
         "parallel" => integer(1, 16)?,
         "embeddings" if matches!(value, "true" | "false") => value.to_string(),
         "embeddings" => return Err("embeddings must be true or false".into()),
-        "pooling" if matches!(value, "none" | "mean" | "cls" | "last" | "rank") => value.to_string(),
+        "pooling" if matches!(value, "none" | "mean" | "cls" | "last" | "rank") => {
+            value.to_string()
+        }
         "pooling" => return Err("pooling must be none, mean, cls, last or rank".into()),
         "batch-size" | "ubatch-size" => integer(1, 65536)?,
         "image-min-tokens" | "image-max-tokens" => integer(1, 16384)?,
@@ -125,17 +132,29 @@ impl Ini {
     pub fn parse(text: &str) -> Ini {
         let mut sections: Vec<(String, Vec<String>)> = vec![(String::new(), Vec::new())];
         for line in text.lines() {
-            if let Some(name) = line.trim().strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            if let Some(name) = line
+                .trim()
+                .strip_prefix('[')
+                .and_then(|s| s.strip_suffix(']'))
+            {
                 sections.push((name.trim().to_string(), vec![line.to_string()]));
             } else {
-                sections.last_mut().expect("header section").1.push(line.to_string());
+                sections
+                    .last_mut()
+                    .expect("header section")
+                    .1
+                    .push(line.to_string());
             }
         }
         Ini { sections }
     }
 
     pub fn render(&self) -> String {
-        let mut lines: Vec<&str> = self.sections.iter().flat_map(|(_, lines)| lines.iter().map(String::as_str)).collect();
+        let mut lines: Vec<&str> = self
+            .sections
+            .iter()
+            .flat_map(|(_, lines)| lines.iter().map(String::as_str))
+            .collect();
         while lines.last().is_some_and(|l| l.trim().is_empty()) {
             lines.pop();
         }
@@ -149,7 +168,11 @@ impl Ini {
     }
 
     pub fn section(&self, name: &str) -> Option<&[String]> {
-        self.sections.iter().skip(1).find(|(n, _)| n == name).map(|(_, lines)| lines.as_slice())
+        self.sections
+            .iter()
+            .skip(1)
+            .find(|(n, _)| n == name)
+            .map(|(_, lines)| lines.as_slice())
     }
 
     /// The keys a section sets, by canonical name.
@@ -189,7 +212,11 @@ impl Ini {
                 checked.push((key, Some(value)));
             }
         }
-        if !self.sections[0].1.iter().any(|l| key_value(l).is_some_and(|(k, _)| k == "version")) {
+        if !self.sections[0]
+            .1
+            .iter()
+            .any(|l| key_value(l).is_some_and(|(k, _)| k == "version"))
+        {
             self.sections[0].1.insert(0, "version = 1".into());
         }
         let index = match self.sections.iter().skip(1).position(|(n, _)| n == name) {
@@ -200,7 +227,8 @@ impl Ini {
                 {
                     last.1.push(String::new());
                 }
-                self.sections.push((name.to_string(), vec![format!("[{name}]")]));
+                self.sections
+                    .push((name.to_string(), vec![format!("[{name}]")]));
                 self.sections.len() - 1
             }
         };
@@ -208,7 +236,10 @@ impl Ini {
         for (key, value) in checked {
             lines.retain(|l| key_value(l).is_none_or(|(k, _)| canonical(k) != key));
             if let Some(value) = value {
-                let at = lines.iter().rposition(|l| !l.trim().is_empty()).map_or(lines.len(), |i| i + 1);
+                let at = lines
+                    .iter()
+                    .rposition(|l| !l.trim().is_empty())
+                    .map_or(lines.len(), |i| i + 1);
                 lines.insert(at, format!("{key} = {value}"));
             }
         }
@@ -219,12 +250,16 @@ impl Ini {
         if let Some(i) = self.sections.iter().skip(1).position(|(n, _)| n == name) {
             return &mut self.sections[i + 1].1;
         }
-        self.sections.push((name.to_string(), vec![String::new(), format!("[{name}]")]));
+        self.sections
+            .push((name.to_string(), vec![String::new(), format!("[{name}]")]));
         &mut self.sections.last_mut().expect("just pushed").1
     }
 
     fn replace_section(&mut self, name: &str, lines: Option<&Vec<String>>) {
-        match (self.sections.iter().skip(1).position(|(n, _)| n == name), lines) {
+        match (
+            self.sections.iter().skip(1).position(|(n, _)| n == name),
+            lines,
+        ) {
             (Some(i), Some(lines)) => self.sections[i + 1].1 = lines.clone(),
             (Some(i), None) => {
                 self.sections.remove(i + 1);
@@ -274,7 +309,11 @@ pub fn router_ini(
     }
     if cpu_only {
         let cpu: BTreeMap<String, String> = [("n-gpu-layers".to_string(), "0".to_string())].into();
-        let names: Vec<String> = out.names().map(str::to_string).chain(["*".to_string()]).collect();
+        let names: Vec<String> = out
+            .names()
+            .map(str::to_string)
+            .chain(["*".to_string()])
+            .collect();
         for name in names {
             let _ = out.set(&name, &cpu);
         }
@@ -306,13 +345,22 @@ mod tests {
     use super::*;
 
     fn changes(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
     fn keeps_other_keys_and_replaces_managed_ones() {
-        let mut ini = Ini::parse("version = 1\n; mine\n[*]\nc = 4096\n\n[org/m:Q4_K_M]\nchat-template = chatml\nctx-size = 8192\n");
-        ini.set("org/m:Q4_K_M", &changes(&[("ctx-size", "65536"), ("cache-type-k", "q8_0")])).unwrap();
+        let mut ini = Ini::parse(
+            "version = 1\n; mine\n[*]\nc = 4096\n\n[org/m:Q4_K_M]\nchat-template = chatml\nctx-size = 8192\n",
+        );
+        ini.set(
+            "org/m:Q4_K_M",
+            &changes(&[("ctx-size", "65536"), ("cache-type-k", "q8_0")]),
+        )
+        .unwrap();
         ini.set("*", &changes(&[("ctx-size", "16384")])).unwrap();
         let text = ini.render();
         assert!(text.contains("chat-template = chatml") && text.contains("; mine"));
@@ -321,7 +369,8 @@ mod tests {
         assert_eq!(ini.effective("org/m:Q4_K_M")["ctx-size"], "65536");
         assert_eq!(ini.effective("other")["ctx-size"], "16384");
         assert_eq!(Ini::parse(&text).render(), text);
-        ini.set("org/m:Q4_K_M", &changes(&[("cache-type-k", "")])).unwrap();
+        ini.set("org/m:Q4_K_M", &changes(&[("cache-type-k", "")]))
+            .unwrap();
         assert!(!ini.render().contains("cache-type-k"));
     }
 
@@ -332,7 +381,10 @@ mod tests {
         assert!(validate("cache-type-k", "q3_9").is_err());
         assert!(validate("model", "/etc/passwd").is_err());
         assert!(validate("top-p", "1.5").is_err());
-        assert_eq!(validate("c", "4096").unwrap(), ("ctx-size".into(), "4096".into()));
+        assert_eq!(
+            validate("c", "4096").unwrap(),
+            ("ctx-size".into(), "4096".into())
+        );
         let mut ini = Ini::parse(DEFAULTS);
         assert!(ini.set("[evil]", &changes(&[("ctx-size", "1")])).is_err());
         assert!(ini.set("m", &changes(&[("model", "/x.gguf")])).is_err());
@@ -343,7 +395,11 @@ mod tests {
         let mut ini = Ini::parse(DEFAULTS);
         ini.set("busy", &changes(&[("ctx-size", "999")])).unwrap();
         let held = [("busy".to_string(), None)].into();
-        let folders = [FolderEntry { id: "local".into(), path: "/m/a.gguf".into(), mmproj: Some("/m/mmproj-a.gguf".into()) }];
+        let folders = [FolderEntry {
+            id: "local".into(),
+            path: "/m/a.gguf".into(),
+            mmproj: Some("/m/mmproj-a.gguf".into()),
+        }];
         let text = router_ini(&ini, &held, &folders, &["embed".to_string()].into(), false);
         assert!(!text.contains("[busy]"));
         assert!(text.contains("[local]\nmodel = /m/a.gguf\nmmproj = /m/mmproj-a.gguf"));
@@ -354,14 +410,32 @@ mod tests {
     #[test]
     fn battery_saver_puts_every_model_on_the_cpu() {
         let mut ini = Ini::parse(DEFAULTS);
-        ini.set("big", &changes(&[("n-gpu-layers", "all"), ("ctx-size", "8192")])).unwrap();
-        let folders = [FolderEntry { id: "local".into(), path: "/m/a.gguf".into(), mmproj: None }];
-        let text = router_ini(&ini, &Default::default(), &folders, &Default::default(), true);
+        ini.set(
+            "big",
+            &changes(&[("n-gpu-layers", "all"), ("ctx-size", "8192")]),
+        )
+        .unwrap();
+        let folders = [FolderEntry {
+            id: "local".into(),
+            path: "/m/a.gguf".into(),
+            mmproj: None,
+        }];
+        let text = router_ini(
+            &ini,
+            &Default::default(),
+            &folders,
+            &Default::default(),
+            true,
+        );
         let cpu = Ini::parse(&text);
         for name in ["*", "big", "local"] {
             assert_eq!(cpu.effective(name)["n-gpu-layers"], "0", "{name}: {text}");
         }
         assert_eq!(cpu.effective("big")["ctx-size"], "8192");
-        assert_eq!(ini.effective("big")["n-gpu-layers"], "all", "the saved settings stay");
+        assert_eq!(
+            ini.effective("big")["n-gpu-layers"],
+            "all",
+            "the saved settings stay"
+        );
     }
 }

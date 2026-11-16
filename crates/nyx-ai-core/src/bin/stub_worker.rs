@@ -51,7 +51,10 @@ fn reply(status: StatusCode, value: Value) -> Response<Body> {
 }
 
 fn error(status: StatusCode, message: &str) -> Response<Body> {
-    reply(status, json!({"error": {"code": status.as_u16(), "message": message}}))
+    reply(
+        status,
+        json!({"error": {"code": status.as_u16(), "message": message}}),
+    )
 }
 
 impl Stub {
@@ -62,19 +65,44 @@ impl Stub {
         let cache = PathBuf::from(std::env::var_os("LLAMA_CACHE").unwrap_or_default());
         for repo in std::fs::read_dir(&cache).into_iter().flatten().flatten() {
             let name = repo.file_name().to_string_lossy().into_owned();
-            let Some(rest) = name.strip_prefix("models--") else { continue };
+            let Some(rest) = name.strip_prefix("models--") else {
+                continue;
+            };
             let repo_id = rest.replacen("--", "/", 1);
-            for rev in std::fs::read_dir(repo.path().join("snapshots")).into_iter().flatten().flatten() {
-                let media = std::fs::read_dir(rev.path()).into_iter().flatten().flatten().any(|f| f.file_name().to_string_lossy().contains("mmproj"));
-                for file in std::fs::read_dir(rev.path()).into_iter().flatten().flatten() {
+            for rev in std::fs::read_dir(repo.path().join("snapshots"))
+                .into_iter()
+                .flatten()
+                .flatten()
+            {
+                let media = std::fs::read_dir(rev.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .any(|f| f.file_name().to_string_lossy().contains("mmproj"));
+                for file in std::fs::read_dir(rev.path())
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                {
                     let file_name = file.file_name().to_string_lossy().into_owned();
-                    let Some(stem) = file_name.strip_suffix(".gguf") else { continue };
+                    let Some(stem) = file_name.strip_suffix(".gguf") else {
+                        continue;
+                    };
                     if stem.contains("mmproj") {
                         continue;
                     }
                     let quant = stem.rsplit('-').next().unwrap_or(stem).to_ascii_uppercase();
                     let path = file.path().display().to_string();
-                    models.insert(format!("{repo_id}:{quant}"), Model { path, source: "cache", status: "unloaded", failed: false, media });
+                    models.insert(
+                        format!("{repo_id}:{quant}"),
+                        Model {
+                            path,
+                            source: "cache",
+                            status: "unloaded",
+                            failed: false,
+                            media,
+                        },
+                    );
                 }
             }
         }
@@ -86,7 +114,16 @@ impl Stub {
                 if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
                     section = name.into();
                 } else if let Some(path) = line.strip_prefix("model =") {
-                    models.insert(section.clone(), Model { path: path.trim().into(), source: "preset", status: "unloaded", failed: false, media: false });
+                    models.insert(
+                        section.clone(),
+                        Model {
+                            path: path.trim().into(),
+                            source: "preset",
+                            status: "unloaded",
+                            failed: false,
+                            media: false,
+                        },
+                    );
                 }
             }
         }
@@ -108,7 +145,11 @@ impl Stub {
                     status["failed"] = json!(true);
                     status["exit_code"] = json!(1);
                 }
-                let inputs = if m.media { json!(["text", "image", "audio"]) } else { json!(["text"]) };
+                let inputs = if m.media {
+                    json!(["text", "image", "audio"])
+                } else {
+                    json!(["text"])
+                };
                 json!({"id": id, "source": m.source, "status": status,
                     "architecture": {"input_modalities": inputs, "output_modalities": ["text"]}})
             })
@@ -129,7 +170,12 @@ impl Stub {
 }
 
 async fn handle(stub: Arc<Stub>, req: Request<Incoming>) -> Result<Response<Body>, Infallible> {
-    let auth = req.headers().get("authorization").and_then(|v| v.to_str().ok()).unwrap_or_default().to_string();
+    let auth = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
     if auth != format!("Bearer {}", stub.key) {
         return Ok(error(StatusCode::UNAUTHORIZED, "Invalid API Key"));
     }
@@ -138,24 +184,36 @@ async fn handle(stub: Arc<Stub>, req: Request<Incoming>) -> Result<Response<Body
     let path = uri.path().to_string();
     let query = uri.query().unwrap_or_default().to_string();
     let param = |name: &str| {
-        query.split('&').find_map(|kv| kv.strip_prefix(&format!("{name}="))).map(|v| {
-            let mut out = Vec::new();
-            let b = v.as_bytes();
-            let mut i = 0;
-            while i < b.len() {
-                if b[i] == b'%' && i + 2 < b.len() {
-                    out.push(u8::from_str_radix(&v[i + 1..i + 3], 16).unwrap_or(b'?'));
-                    i += 3;
-                } else {
-                    out.push(b[i]);
-                    i += 1;
+        query
+            .split('&')
+            .find_map(|kv| kv.strip_prefix(&format!("{name}=")))
+            .map(|v| {
+                let mut out = Vec::new();
+                let b = v.as_bytes();
+                let mut i = 0;
+                while i < b.len() {
+                    if b[i] == b'%' && i + 2 < b.len() {
+                        out.push(u8::from_str_radix(&v[i + 1..i + 3], 16).unwrap_or(b'?'));
+                        i += 3;
+                    } else {
+                        out.push(b[i]);
+                        i += 1;
+                    }
                 }
-            }
-            String::from_utf8_lossy(&out).into_owned()
-        })
+                String::from_utf8_lossy(&out).into_owned()
+            })
     };
-    let body: Value = req.into_body().collect().await.map(|b| serde_json::from_slice(&b.to_bytes()).unwrap_or(Value::Null)).unwrap_or(Value::Null);
-    let model = body["model"].as_str().map(String::from).or_else(|| param("model")).unwrap_or_default();
+    let body: Value = req
+        .into_body()
+        .collect()
+        .await
+        .map(|b| serde_json::from_slice(&b.to_bytes()).unwrap_or(Value::Null))
+        .unwrap_or(Value::Null);
+    let model = body["model"]
+        .as_str()
+        .map(String::from)
+        .or_else(|| param("model"))
+        .unwrap_or_default();
     Ok(match (method.as_str(), path.as_str()) {
         ("GET", "/health") => reply(StatusCode::OK, json!({"status": "ok"})),
         ("GET", "/models") => {
@@ -196,23 +254,50 @@ async fn handle(stub: Arc<Stub>, req: Request<Incoming>) -> Result<Response<Body
             }
         }
         ("GET", "/props") => {
-            let slots: u64 = std::env::var("STUB_SLOTS").ok().and_then(|s| s.parse().ok()).unwrap_or(2);
-            reply(StatusCode::OK, json!({"total_slots": slots, "default_generation_settings": {"n_ctx": 4096},
-                "chat_template_caps": {"supports_reasoning_effort": false}, "media_marker": MARKER}))
+            let slots: u64 = std::env::var("STUB_SLOTS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(2);
+            reply(
+                StatusCode::OK,
+                json!({"total_slots": slots, "default_generation_settings": {"n_ctx": 4096},
+                "chat_template_caps": {"supports_reasoning_effort": false}, "media_marker": MARKER}),
+            )
         }
         ("POST", "/v1/chat/completions") => {
             if stub.status(&model) != Some("loaded") {
                 return Ok(error(StatusCode::BAD_REQUEST, "model is not loaded"));
             }
-            let last = body["messages"].as_array().and_then(|m| m.last()).map(|m| m["content"].to_string()).unwrap_or_default();
-            let count: usize = last.split("count:").nth(1).and_then(|s| s.chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().ok()).unwrap_or(5);
+            let last = body["messages"]
+                .as_array()
+                .and_then(|m| m.last())
+                .map(|m| m["content"].to_string())
+                .unwrap_or_default();
+            let count: usize = last
+                .split("count:")
+                .nth(1)
+                .and_then(|s| {
+                    s.chars()
+                        .take_while(|c| c.is_ascii_digit())
+                        .collect::<String>()
+                        .parse()
+                        .ok()
+                })
+                .unwrap_or(5);
             let crash = last.contains("crash");
-            let delay = std::env::var("STUB_DELAY_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
+            let delay = std::env::var("STUB_DELAY_MS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(10);
             let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(4);
             tokio::spawn(async move {
                 for i in 0..count {
                     let chunk = json!({"choices": [{"delta": {"content": format!("tok{i} ")}}]});
-                    if tx.send(Bytes::from(format!("data: {chunk}\n\n"))).await.is_err() {
+                    if tx
+                        .send(Bytes::from(format!("data: {chunk}\n\n")))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                     if crash {
@@ -223,9 +308,15 @@ async fn handle(stub: Arc<Stub>, req: Request<Incoming>) -> Result<Response<Body
                 }
                 let end = json!({"choices": [{"delta": {}, "finish_reason": "stop"}],
                     "usage": {"prompt_tokens": 7, "completion_tokens": count}, "timings": {"prompt_ms": 3.0, "predicted_per_second": 100.0}});
-                let _ = tx.send(Bytes::from(format!("data: {end}\n\ndata: [DONE]\n\n"))).await;
+                let _ = tx
+                    .send(Bytes::from(format!("data: {end}\n\ndata: [DONE]\n\n")))
+                    .await;
             });
-            let stream = futures_util::stream::unfold(rx, |mut rx| async move { rx.recv().await.map(|b| (Ok::<_, Infallible>(Frame::data(b)), rx)) });
+            let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+                rx.recv()
+                    .await
+                    .map(|b| (Ok::<_, Infallible>(Frame::data(b)), rx))
+            });
             Response::builder()
                 .header("content-type", "text/event-stream")
                 .body(StreamBody::new(stream.boxed()).boxed_unsync())
@@ -256,10 +347,23 @@ async fn handle(stub: Arc<Stub>, req: Request<Incoming>) -> Result<Response<Body
             for (i, item) in body["content"].as_array().into_iter().flatten().enumerate() {
                 let first = match item {
                     Value::String(text) => text.len() as f32,
-                    _ if item["prompt_string"] == MARKER && item["multimodal_data"].as_array().is_some_and(|m| m.len() == 1) => 1000.0,
-                    _ => return Ok(error(StatusCode::INTERNAL_SERVER_ERROR, "Failed to tokenize prompt")),
+                    _ if item["prompt_string"] == MARKER
+                        && item["multimodal_data"]
+                            .as_array()
+                            .is_some_and(|m| m.len() == 1) =>
+                    {
+                        1000.0
+                    }
+                    _ => {
+                        return Ok(error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to tokenize prompt",
+                        ));
+                    }
                 };
-                data.push(json!({"index": i, "embedding": [[first, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5]]}));
+                data.push(
+                    json!({"index": i, "embedding": [[first, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.5]]}),
+                );
             }
             data.reverse();
             reply(StatusCode::OK, Value::Array(data))
@@ -272,19 +376,36 @@ async fn handle(stub: Arc<Stub>, req: Request<Incoming>) -> Result<Response<Body
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let arg = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    let arg = |name: &str| {
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
+    };
     let host = arg("--host").expect("--host");
-    let key = arg("--api-key-file").and_then(|f| std::fs::read_to_string(f).ok()).unwrap_or_default().trim().to_string();
-    let stub = Arc::new(Stub { key, preset: arg("--models-preset").map(PathBuf::from), models: Mutex::new(BTreeMap::new()) });
+    let key = arg("--api-key-file")
+        .and_then(|f| std::fs::read_to_string(f).ok())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let stub = Arc::new(Stub {
+        key,
+        preset: arg("--models-preset").map(PathBuf::from),
+        models: Mutex::new(BTreeMap::new()),
+    });
     stub.read_models();
     let _ = std::fs::remove_file(&host);
     let listener = tokio::net::UnixListener::bind(&host).expect("bind");
     loop {
-        let Ok((stream, _)) = listener.accept().await else { continue };
+        let Ok((stream, _)) = listener.accept().await else {
+            continue;
+        };
         let stub = stub.clone();
         tokio::spawn(async move {
             let service = hyper::service::service_fn(move |req| handle(stub.clone(), req));
-            let _ = hyper::server::conn::http1::Builder::new().serve_connection(TokioIo::new(stream), service).await;
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), service)
+                .await;
         });
     }
 }

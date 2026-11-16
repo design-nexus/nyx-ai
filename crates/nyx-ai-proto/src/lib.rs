@@ -57,8 +57,14 @@ pub struct Request {
 #[serde(rename_all = "snake_case")]
 pub enum ServerLine {
     Hello(Welcome),
-    Event { id: u64, event: Event },
-    Result { id: u64, result: Reply },
+    Event {
+        id: u64,
+        event: Event,
+    },
+    Result {
+        id: u64,
+        result: Reply,
+    },
     Error {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         id: Option<u64>,
@@ -77,7 +83,9 @@ pub struct Welcome {
 
 // ---------- Operations ----------
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum Priority {
     Background,
@@ -341,11 +349,18 @@ pub struct Message {
 
 impl Message {
     pub fn text(role: Role, text: impl Into<String>) -> Message {
-        Message { role, content: Content::Text(text.into()), tool_calls: Vec::new(), tool_call_id: None }
+        Message {
+            role,
+            content: Content::Text(text.into()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        }
     }
 }
 
-fn null_as_default<'de, D: Deserializer<'de>, T: Default + Deserialize<'de>>(d: D) -> Result<T, D::Error> {
+fn null_as_default<'de, D: Deserializer<'de>, T: Default + Deserialize<'de>>(
+    d: D,
+) -> Result<T, D::Error> {
     Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
 }
 
@@ -365,11 +380,17 @@ impl Default for Content {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Part {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     /// A `data:image/…;base64,…` URL. Remote URLs are refused so the worker
     /// never fetches anything.
-    ImageUrl { image_url: ImageUrl },
-    InputAudio { input_audio: InputAudio },
+    ImageUrl {
+        image_url: ImageUrl,
+    },
+    InputAudio {
+        input_audio: InputAudio,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -485,7 +506,9 @@ impl ChatRequest {
             for call in &message.tool_calls {
                 valid_tool_name(&call.function.name)?;
             }
-            if message.role == Role::Tool && message.tool_call_id.as_deref().is_none_or(str::is_empty) {
+            if message.role == Role::Tool
+                && message.tool_call_id.as_deref().is_none_or(str::is_empty)
+            {
                 return Err("a tool message needs tool_call_id".into());
             }
         }
@@ -494,12 +517,21 @@ impl ChatRequest {
                 return Err(format!("unsupported tool type {}", tool.kind));
             }
             valid_tool_name(&tool.function.name)?;
-            if tool.function.parameters.as_ref().is_some_and(|p| !p.is_object()) {
-                return Err(format!("tool {} parameters must be a JSON schema object", tool.function.name));
+            if tool
+                .function
+                .parameters
+                .as_ref()
+                .is_some_and(|p| !p.is_object())
+            {
+                return Err(format!(
+                    "tool {} parameters must be a JSON schema object",
+                    tool.function.name
+                ));
             }
         }
         if let Some(choice) = &self.tool_choice
-            && !(choice.is_object() || matches!(choice.as_str(), Some("auto" | "none" | "required")))
+            && !(choice.is_object()
+                || matches!(choice.as_str(), Some("auto" | "none" | "required")))
         {
             return Err("tool_choice must be auto, none, required or a function".into());
         }
@@ -510,7 +542,10 @@ impl ChatRequest {
         }
         if let Some(grammar) = &self.grammar {
             if grammar.trim().is_empty() || grammar.len() > MAX_GRAMMAR {
-                return Err(format!("a grammar must be between 1 byte and {} KB", MAX_GRAMMAR >> 10));
+                return Err(format!(
+                    "a grammar must be between 1 byte and {} KB",
+                    MAX_GRAMMAR >> 10
+                ));
             }
             if !self.tools.is_empty() || self.response_format.is_some() {
                 return Err("a grammar can't go with tools or response_format".into());
@@ -523,7 +558,9 @@ impl ChatRequest {
         }
         let s = &self.sampling;
         let range = |name: &str, v: Option<f64>, lo: f64, hi: f64| match v {
-            Some(v) if !(lo..=hi).contains(&v) || v.is_nan() => Err(format!("{name} must be between {lo} and {hi}")),
+            Some(v) if !(lo..=hi).contains(&v) || v.is_nan() => {
+                Err(format!("{name} must be between {lo} and {hi}"))
+            }
             _ => Ok(()),
         };
         range("temperature", s.temperature, 0.0, 5.0)?;
@@ -545,8 +582,14 @@ impl ChatRequest {
 fn valid_tool_name(name: &str) -> Result<(), String> {
     let ok = !name.is_empty()
         && name.len() <= 128
-        && name.bytes().all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'));
-    if ok { Ok(()) } else { Err(format!("invalid tool name {name:?}")) }
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("invalid tool name {name:?}"))
+    }
 }
 
 /// A model ID: `org/repo:QUANT` for the cache, or a plain name for a folder or
@@ -556,8 +599,14 @@ pub fn valid_model_id(id: &str) -> Result<(), String> {
         && id.len() <= 256
         && !id.starts_with(['/', '.', '-'])
         && !id.contains("..")
-        && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | ':' | '_' | '-' | '.' | '+'));
-    if ok { Ok(()) } else { Err(format!("invalid model id {id:?}")) }
+        && id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | ':' | '_' | '-' | '.' | '+'));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("invalid model id {id:?}"))
+    }
 }
 
 // ---------- Actions ----------
@@ -637,8 +686,12 @@ pub struct ActionInfo {
 pub enum Event {
     Accepted,
     /// Waiting behind `position` other requests for the model.
-    Queued { position: usize },
-    ModelLoading { model: String },
+    Queued {
+        position: usize,
+    },
+    ModelLoading {
+        model: String,
+    },
     Started,
     Delta {
         #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -648,9 +701,18 @@ pub enum Event {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         tool_calls: Vec<ToolCallDelta>,
     },
-    Progress { status: String, completed: u64, total: u64 },
+    Progress {
+        status: String,
+        completed: u64,
+        total: u64,
+    },
     /// A call to one of this connection's served actions; answer with `action_result`.
-    Invoke { invocation: u64, action: String, arguments: Value, caller: String },
+    Invoke {
+        invocation: u64,
+        action: String,
+        arguments: Value,
+        caller: String,
+    },
 }
 
 /// Part of a tool call; parts with the same `index` concatenate.
@@ -671,15 +733,26 @@ pub struct ToolCallDelta {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Reply {
     Ok,
-    Models { models: Vec<Model> },
+    Models {
+        models: Vec<Model>,
+    },
     ModelInfo(Box<ModelDetail>),
-    Loaded { model: String },
-    Unloaded { model: String, unloaded: bool },
+    Loaded {
+        model: String,
+    },
+    Unloaded {
+        model: String,
+        unloaded: bool,
+    },
     Settings(ModelSettings),
-    Downloads { downloads: Vec<Download> },
+    Downloads {
+        downloads: Vec<Download>,
+    },
     Finished(Finished),
     Embeddings(Embeddings),
-    Template { prompt: String },
+    Template {
+        prompt: String,
+    },
     Resources(ResourceStatus),
     Worker(WorkerStatus),
     Capabilities(Capabilities),
@@ -692,7 +765,9 @@ pub enum Reply {
         apps: Option<Vec<Value>>,
     },
     /// What an action returned.
-    ActionDone { result: Value },
+    ActionDone {
+        result: Value,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1062,7 +1137,10 @@ pub struct Error {
 
 impl Error {
     pub fn new(kind: ErrorKind, message: impl Into<String>) -> Error {
-        Error { kind, message: message.into() }
+        Error {
+            kind,
+            message: message.into(),
+        }
     }
 }
 
@@ -1076,15 +1154,26 @@ impl std::error::Error for Error {}
 
 /// Parse a client line, telling an unknown operation apart from a malformed one.
 pub fn decode_client_line(line: &str) -> Result<ClientLine, (Option<u64>, Error)> {
-    let value: Value = serde_json::from_str(line)
-        .map_err(|e| (None, Error::new(ErrorKind::InvalidRequest, format!("not JSON: {e}"))))?;
+    let value: Value = serde_json::from_str(line).map_err(|e| {
+        (
+            None,
+            Error::new(ErrorKind::InvalidRequest, format!("not JSON: {e}")),
+        )
+    })?;
     let id = value["request"]["id"].as_u64();
     if let Some(kind) = value["request"]["op"]["type"].as_str()
         && !OPERATIONS.contains(&kind)
     {
-        return Err((id, Error::new(ErrorKind::UnsupportedOperation, format!("unknown operation {kind}"))));
+        return Err((
+            id,
+            Error::new(
+                ErrorKind::UnsupportedOperation,
+                format!("unknown operation {kind}"),
+            ),
+        ));
     }
-    serde_json::from_value(value).map_err(|e| (id, Error::new(ErrorKind::InvalidRequest, e.to_string())))
+    serde_json::from_value(value)
+        .map_err(|e| (id, Error::new(ErrorKind::InvalidRequest, e.to_string())))
 }
 
 pub fn encode<T: Serialize>(line: &T) -> String {
@@ -1106,15 +1195,33 @@ mod tests {
     fn operations_round_trip() {
         let ops = vec![
             Op::ListModels {},
-            Op::LoadModel { model: "org/m:Q4_K_M".into(), keep: true },
-            Op::ConfigureModel { model: "*".into(), settings: [("ctx-size".to_string(), "8192".to_string())].into() },
+            Op::LoadModel {
+                model: "org/m:Q4_K_M".into(),
+                keep: true,
+            },
+            Op::ConfigureModel {
+                model: "*".into(),
+                settings: [("ctx-size".to_string(), "8192".to_string())].into(),
+            },
             Op::Chat(ChatRequest {
                 model: "org/m:Q4_K_M".into(),
                 messages: vec![Message::text(Role::User, "hi")],
-                sampling: Sampling { temperature: Some(0.2), ..Default::default() },
+                sampling: Sampling {
+                    temperature: Some(0.2),
+                    ..Default::default()
+                },
                 ..Default::default()
             }),
-            Op::Embed { model: "e".into(), input: vec!["a".into(), EmbedInput::Image { image: "aGk=".into() }], priority: Priority::Background },
+            Op::Embed {
+                model: "e".into(),
+                input: vec![
+                    "a".into(),
+                    EmbedInput::Image {
+                        image: "aGk=".into(),
+                    },
+                ],
+                priority: Priority::Background,
+            },
             Op::ConfigureService {
                 max_loaded: Some(2),
                 idle_unload_seconds: None,
@@ -1128,7 +1235,10 @@ mod tests {
         ];
         for op in ops {
             assert!(OPERATIONS.contains(&op.name()));
-            let line = encode(&ClientLine::Request(Box::new(Request { id: 1, op: op.clone() })));
+            let line = encode(&ClientLine::Request(Box::new(Request {
+                id: 1,
+                op: op.clone(),
+            })));
             match decode_client_line(line.trim()).unwrap() {
                 ClientLine::Request(r) => assert_eq!(r.op, op),
                 other => panic!("{other:?}"),
@@ -1138,22 +1248,38 @@ mod tests {
 
     #[test]
     fn unknown_fields_and_operations_are_errors() {
-        let (id, e) = decode_client_line(&request(json!({"type": "list_models", "extra": 1}))).unwrap_err();
+        let (id, e) =
+            decode_client_line(&request(json!({"type": "list_models", "extra": 1}))).unwrap_err();
         assert_eq!((id, e.kind), (Some(7), ErrorKind::InvalidRequest));
-        let (_, e) = decode_client_line(&request(json!({"type": "chat", "model": "m", "messages": [], "nope": true}))).unwrap_err();
+        let (_, e) = decode_client_line(&request(
+            json!({"type": "chat", "model": "m", "messages": [], "nope": true}),
+        ))
+        .unwrap_err();
         assert_eq!(e.kind, ErrorKind::InvalidRequest);
         let (_, e) = decode_client_line(&request(json!({"type": "summon_dragon"}))).unwrap_err();
         assert_eq!(e.kind, ErrorKind::UnsupportedOperation);
-        let (_, e) = decode_client_line(r#"{"hello":{"api_version":1,"client":"x","debug":true}}"#).unwrap_err();
+        let (_, e) = decode_client_line(r#"{"hello":{"api_version":1,"client":"x","debug":true}}"#)
+            .unwrap_err();
         assert_eq!(e.kind, ErrorKind::InvalidRequest);
     }
 
     #[test]
     fn action_details_are_asked_for() {
-        assert_eq!(serde_json::to_value(Op::ListActions { detail: false }).unwrap(), json!({"type": "list_actions"}));
-        let ClientLine::Request(r) = decode_client_line(&request(json!({"type": "list_actions", "detail": true}))).unwrap() else { panic!() };
+        assert_eq!(
+            serde_json::to_value(Op::ListActions { detail: false }).unwrap(),
+            json!({"type": "list_actions"})
+        );
+        let ClientLine::Request(r) =
+            decode_client_line(&request(json!({"type": "list_actions", "detail": true}))).unwrap()
+        else {
+            panic!()
+        };
         assert_eq!(r.op, Op::ListActions { detail: true });
-        let reply = serde_json::to_value(Reply::Actions { actions: vec![], apps: None }).unwrap();
+        let reply = serde_json::to_value(Reply::Actions {
+            actions: vec![],
+            apps: None,
+        })
+        .unwrap();
         assert_eq!(reply, json!({"type": "actions", "actions": []}));
     }
 
@@ -1168,7 +1294,9 @@ mod tests {
             {"role": "tool", "tool_call_id": "c1", "content": "ok"}
         ], "tools": [{"type": "function", "function": {"name": "web_search", "parameters": {"type": "object"}}}],
            "response_format": {"type": "json_object"}, "thinking": true, "priority": "interactive"}));
-        let ClientLine::Request(r) = decode_client_line(&line).unwrap() else { panic!() };
+        let ClientLine::Request(r) = decode_client_line(&line).unwrap() else {
+            panic!()
+        };
         let Op::Chat(request) = r.op else { panic!() };
         assert!(request.has_images());
         assert_eq!(request.priority, Priority::Interactive);
@@ -1177,7 +1305,11 @@ mod tests {
 
     #[test]
     fn validation() {
-        let mut r = ChatRequest { model: "m".into(), messages: vec![Message::text(Role::User, "x")], ..Default::default() };
+        let mut r = ChatRequest {
+            model: "m".into(),
+            messages: vec![Message::text(Role::User, "x")],
+            ..Default::default()
+        };
         r.validate().unwrap();
         r.grammar = Some(r#"root ::= "yes" | "no""#.into());
         r.validate().unwrap();
@@ -1190,7 +1322,11 @@ mod tests {
         r.sampling.temperature = Some(9.0);
         assert!(r.validate().is_err());
         r.sampling.temperature = None;
-        r.messages[0].content = Content::Parts(vec![Part::ImageUrl { image_url: ImageUrl { url: "https://x/y.png".into() } }]);
+        r.messages[0].content = Content::Parts(vec![Part::ImageUrl {
+            image_url: ImageUrl {
+                url: "https://x/y.png".into(),
+            },
+        }]);
         assert!(r.validate().unwrap_err().contains("data:"));
         r.messages = vec![];
         assert!(r.validate().is_err());
@@ -1204,14 +1340,31 @@ mod tests {
     fn server_lines() {
         let line = encode(&ServerLine::Event {
             id: 3,
-            event: Event::Delta { content: "hi".into(), reasoning: String::new(), tool_calls: vec![] },
+            event: Event::Delta {
+                content: "hi".into(),
+                reasoning: String::new(),
+                tool_calls: vec![],
+            },
         });
-        assert_eq!(line, "{\"event\":{\"id\":3,\"event\":{\"type\":\"delta\",\"content\":\"hi\"}}}\n");
+        assert_eq!(
+            line,
+            "{\"event\":{\"id\":3,\"event\":{\"type\":\"delta\",\"content\":\"hi\"}}}\n"
+        );
         let back: ServerLine = serde_json::from_str(line.trim()).unwrap();
         assert!(matches!(back, ServerLine::Event { id: 3, .. }));
-        let err = encode(&ServerLine::Error { id: None, error: Error::new(ErrorKind::IncompatibleVersion, "v2 needed") });
+        let err = encode(&ServerLine::Error {
+            id: None,
+            error: Error::new(ErrorKind::IncompatibleVersion, "v2 needed"),
+        });
         assert!(err.contains("incompatible_version"));
-        let ok: ServerLine = serde_json::from_str(r#"{"result":{"id":1,"result":{"type":"ok"}}}"#).unwrap();
-        assert_eq!(ok, ServerLine::Result { id: 1, result: Reply::Ok });
+        let ok: ServerLine =
+            serde_json::from_str(r#"{"result":{"id":1,"result":{"type":"ok"}}}"#).unwrap();
+        assert_eq!(
+            ok,
+            ServerLine::Result {
+                id: 1,
+                result: Reply::Ok
+            }
+        );
     }
 }

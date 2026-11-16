@@ -16,11 +16,18 @@ static KNOWN_VRAM: AtomicU64 = AtomicU64::new(0);
 
 pub fn detect() -> Memory {
     let cached = KNOWN_VRAM.load(Ordering::Relaxed);
-    let vram = amd_vram().or_else(nvidia_vram).or((cached > 0).then_some(cached)).or_else(nvidia_bar).unwrap_or(0);
+    let vram = amd_vram()
+        .or_else(nvidia_vram)
+        .or((cached > 0).then_some(cached))
+        .or_else(nvidia_bar)
+        .unwrap_or(0);
     if vram > 0 {
         KNOWN_VRAM.store(vram, Ordering::Relaxed);
     }
-    Memory { vram, ram: meminfo("MemTotal:").unwrap_or(0) }
+    Memory {
+        vram,
+        ram: meminfo("MemTotal:").unwrap_or(0),
+    }
 }
 
 /// Memory the loaded models may use: nearly all of the GPU, and part of RAM
@@ -38,7 +45,9 @@ pub fn available_ram() -> u64 {
 pub fn memory_pressure() -> Option<f64> {
     let text = std::fs::read_to_string("/proc/pressure/memory").ok()?;
     let line = text.lines().find(|l| l.starts_with("some "))?;
-    line.split_whitespace().find_map(|f| f.strip_prefix("avg10=")).and_then(|v| v.parse().ok())
+    line.split_whitespace()
+        .find_map(|f| f.strip_prefix("avg10="))
+        .and_then(|v| v.parse().ok())
 }
 
 /// Too little memory left to keep idle models around.
@@ -48,7 +57,13 @@ pub fn under_pressure(total: u64, available: u64, psi: Option<f64>) -> bool {
 
 fn meminfo(key: &str) -> Option<u64> {
     let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-    text.lines().find(|l| l.starts_with(key))?.split_whitespace().nth(1)?.parse::<u64>().ok().map(|kb| kb * 1024)
+    text.lines()
+        .find(|l| l.starts_with(key))?
+        .split_whitespace()
+        .nth(1)?
+        .parse::<u64>()
+        .ok()
+        .map(|kb| kb * 1024)
 }
 
 /// An NVIDIA card's memory window (BAR 1) from sysfs, which doesn't wake it.
@@ -70,7 +85,9 @@ fn nvidia_gpu(dev: &Path) -> bool {
 
 fn bar1_size(resource: &str) -> Option<u64> {
     let line = resource.lines().nth(1)?;
-    let mut parts = line.split_whitespace().map(|x| u64::from_str_radix(x.trim_start_matches("0x"), 16).ok());
+    let mut parts = line
+        .split_whitespace()
+        .map(|x| u64::from_str_radix(x.trim_start_matches("0x"), 16).ok());
     let (start, end) = (parts.next()??, parts.next()??);
     let size = end.checked_sub(start)? + 1;
     // Small windows (256 MB without resizable BAR) say nothing about the memory.
@@ -81,18 +98,29 @@ fn amd_vram() -> Option<u64> {
     std::fs::read_dir("/sys/class/drm")
         .ok()?
         .flatten()
-        .filter_map(|e| std::fs::read_to_string(e.path().join("device/mem_info_vram_total")).ok()?.trim().parse::<u64>().ok())
+        .filter_map(|e| {
+            std::fs::read_to_string(e.path().join("device/mem_info_vram_total"))
+                .ok()?
+                .trim()
+                .parse::<u64>()
+                .ok()
+        })
         // An APU reports a small carve-out; only count real cards.
         .filter(|v| *v >= 2 << 30)
         .max()
 }
 
 fn nvidia_vram() -> Option<u64> {
-    let awake = std::fs::read_dir("/sys/bus/pci/devices").ok()?.flatten().any(|e| {
-        let dev = e.path();
-        nvidia_gpu(&dev)
-            && std::fs::read_to_string(dev.join("power/runtime_status")).map(|s| s.trim() != "suspended").unwrap_or(true)
-    });
+    let awake = std::fs::read_dir("/sys/bus/pci/devices")
+        .ok()?
+        .flatten()
+        .any(|e| {
+            let dev = e.path();
+            nvidia_gpu(&dev)
+                && std::fs::read_to_string(dev.join("power/runtime_status"))
+                    .map(|s| s.trim() != "suspended")
+                    .unwrap_or(true)
+        });
     if !awake {
         return None;
     }
@@ -104,7 +132,11 @@ fn nvidia_vram() -> Option<u64> {
     if !out.status.success() {
         return None;
     }
-    String::from_utf8_lossy(&out.stdout).lines().filter_map(|l| l.trim().parse::<u64>().ok()).max().map(|mib| mib * 1024 * 1024)
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.trim().parse::<u64>().ok())
+        .max()
+        .map(|mib| mib * 1024 * 1024)
 }
 
 /// GPU backends the worker build carries, from its `libggml-*.so` files.
@@ -115,8 +147,16 @@ pub fn gpu_backends(worker_dir: Option<&Path>) -> Vec<String> {
     {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            for (lib, backend) in [("cuda", "cuda"), ("vulkan", "vulkan"), ("hip", "rocm"), ("sycl", "sycl"), ("metal", "metal")] {
-                if name.starts_with(&format!("libggml-{lib}")) && !found.iter().any(|b| b == backend) {
+            for (lib, backend) in [
+                ("cuda", "cuda"),
+                ("vulkan", "vulkan"),
+                ("hip", "rocm"),
+                ("sycl", "sycl"),
+                ("metal", "metal"),
+            ] {
+                if name.starts_with(&format!("libggml-{lib}"))
+                    && !found.iter().any(|b| b == backend)
+                {
                     found.push(backend.to_string());
                 }
             }
@@ -154,9 +194,18 @@ mod tests {
     fn needs_and_budget() {
         assert!(needed(4 * GB, 65536, "q4_0") < needed(4 * GB, 65536, "q8_0"));
         assert!(needed(4 * GB, 65536, "q8_0") < needed(4 * GB, 65536, "f16"));
-        let mem = Memory { vram: 16 * GB, ram: 32 * GB };
+        let mem = Memory {
+            vram: 16 * GB,
+            ram: 32 * GB,
+        };
         assert!(needed(12 * GB, 8192, "f16") < budget(mem));
-        assert_eq!(budget(Memory { vram: 0, ram: 10 * GB }), 6 * GB);
+        assert_eq!(
+            budget(Memory {
+                vram: 0,
+                ram: 10 * GB
+            }),
+            6 * GB
+        );
     }
 
     #[test]
@@ -177,7 +226,11 @@ mod tests {
     #[test]
     fn backends_from_libraries() {
         let dir = tempfile::tempdir().unwrap();
-        for f in ["libggml-cuda.so", "libggml-cpu-haswell.so", "libggml-base.so"] {
+        for f in [
+            "libggml-cuda.so",
+            "libggml-cpu-haswell.so",
+            "libggml-base.so",
+        ] {
             std::fs::write(dir.path().join(f), "").unwrap();
         }
         assert_eq!(gpu_backends(Some(dir.path())), ["cuda", "cpu"]);

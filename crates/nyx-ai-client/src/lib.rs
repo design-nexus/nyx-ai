@@ -7,9 +7,10 @@
 pub use nyx_ai_proto as proto;
 
 use proto::{
-    API_VERSION, ActionInfo, ActionSpec, Capabilities, ChatRequest, ClientLine, Download, EmbedInput, Embeddings, Error, ErrorKind, Event, Hello, MAX_LINE, Model,
-    ModelDetail, ModelSettings, Op, Priority, Reply, Request, ResourceStatus, ServerLine, ServiceSettings, ToolCallDelta,
-    WorkerStatus, encode,
+    API_VERSION, ActionInfo, ActionSpec, Capabilities, ChatRequest, ClientLine, Download,
+    EmbedInput, Embeddings, Error, ErrorKind, Event, Hello, MAX_LINE, Model, ModelDetail,
+    ModelSettings, Op, Priority, Reply, Request, ResourceStatus, ServerLine, ServiceSettings,
+    ToolCallDelta, WorkerStatus, encode,
 };
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -37,12 +38,19 @@ pub fn socket_path() -> PathBuf {
 
 /// The socket must be a socket, ours, and closed to everyone else.
 pub fn check_socket(path: &Path) -> Result<()> {
-    let meta = std::fs::symlink_metadata(path)
-        .map_err(|e| Error::new(ErrorKind::Unavailable, format!("Nyx AI Core isn't running ({}: {e})", path.display())))?;
+    let meta = std::fs::symlink_metadata(path).map_err(|e| {
+        Error::new(
+            ErrorKind::Unavailable,
+            format!("Nyx AI Core isn't running ({}: {e})", path.display()),
+        )
+    })?;
     // SAFETY: getuid has no preconditions.
     let uid = unsafe { libc::getuid() };
     if !meta.file_type().is_socket() || meta.uid() != uid || meta.mode() & 0o077 != 0 {
-        return Err(Error::new(ErrorKind::PermissionDenied, format!("{} isn't a private socket of this user", path.display())));
+        return Err(Error::new(
+            ErrorKind::PermissionDenied,
+            format!("{} isn't a private socket of this user", path.display()),
+        ));
     }
     Ok(())
 }
@@ -56,11 +64,17 @@ pub struct Client {
 impl Client {
     /// `app` names the application, e.g. `nyx-chat`.
     pub fn new(app: &str) -> Client {
-        Client { app: app.into(), socket: socket_path() }
+        Client {
+            app: app.into(),
+            socket: socket_path(),
+        }
     }
 
     pub fn with_socket(app: &str, socket: impl Into<PathBuf>) -> Client {
-        Client { app: app.into(), socket: socket.into() }
+        Client {
+            app: app.into(),
+            socket: socket.into(),
+        }
     }
 
     pub fn socket(&self) -> &Path {
@@ -80,17 +94,36 @@ impl Client {
             check_socket(&self.socket)?;
             match UnixStream::connect(&self.socket).await {
                 Ok(stream) => break stream,
-                Err(e) if attempt < 3 && matches!(e.kind(), std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound) => {
+                Err(e)
+                    if attempt < 3
+                        && matches!(
+                            e.kind(),
+                            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::NotFound
+                        ) =>
+                {
                     attempt += 1;
                     tokio::time::sleep(delay).await;
                     delay *= 3;
                 }
-                Err(e) => return Err(Error::new(ErrorKind::Unavailable, format!("Nyx AI Core isn't reachable: {e}"))),
+                Err(e) => {
+                    return Err(Error::new(
+                        ErrorKind::Unavailable,
+                        format!("Nyx AI Core isn't reachable: {e}"),
+                    ));
+                }
             }
         };
         let (read, write) = stream.into_split();
-        let mut conn = Connection { reader: BufReader::new(read), writer: write, line: Vec::new() };
-        conn.send(&ClientLine::Hello(Hello { api_version: API_VERSION, client: self.app.clone() })).await?;
+        let mut conn = Connection {
+            reader: BufReader::new(read),
+            writer: write,
+            line: Vec::new(),
+        };
+        conn.send(&ClientLine::Hello(Hello {
+            api_version: API_VERSION,
+            client: self.app.clone(),
+        }))
+        .await?;
         let reply = tokio::time::timeout(Duration::from_secs(10), conn.read())
             .await
             .map_err(|_| Error::new(ErrorKind::Timeout, "Nyx AI Core didn't answer"))??;
@@ -98,7 +131,10 @@ impl Client {
             ServerLine::Hello(welcome) if welcome.api_version == API_VERSION => Ok(conn),
             ServerLine::Hello(welcome) => Err(Error::new(
                 ErrorKind::IncompatibleVersion,
-                format!("Nyx AI Core speaks version {}, this app version {API_VERSION}", welcome.api_version),
+                format!(
+                    "Nyx AI Core speaks version {}, this app version {API_VERSION}",
+                    welcome.api_version
+                ),
             )),
             ServerLine::Error { error, .. } => Err(error),
             other => Err(unexpected(&other)),
@@ -113,14 +149,22 @@ impl Client {
                 return Ok(reply);
             }
         }
-        Err(Error::new(ErrorKind::Unavailable, "Nyx AI Core closed the connection"))
+        Err(Error::new(
+            ErrorKind::Unavailable,
+            "Nyx AI Core closed the connection",
+        ))
     }
 
     /// Send one operation and read its events and result as they come.
     pub async fn stream(&self, op: Op) -> Result<Stream> {
         let mut conn = self.connect().await?;
-        conn.send(&ClientLine::Request(Box::new(Request { id: 1, op }))).await?;
-        Ok(Stream { conn, id: 1, done: false })
+        conn.send(&ClientLine::Request(Box::new(Request { id: 1, op })))
+            .await?;
+        Ok(Stream {
+            conn,
+            id: 1,
+            done: false,
+        })
     }
 
     pub async fn list_models(&self) -> Result<Vec<Model>> {
@@ -131,14 +175,25 @@ impl Client {
     }
 
     pub async fn model_info(&self, model: &str) -> Result<ModelDetail> {
-        match self.call(Op::ModelInfo { model: model.into() }).await? {
+        match self
+            .call(Op::ModelInfo {
+                model: model.into(),
+            })
+            .await?
+        {
             Reply::ModelInfo(detail) => Ok(*detail),
             other => Err(unexpected(&other)),
         }
     }
 
     pub async fn load_model(&self, model: &str, keep: bool) -> Result<()> {
-        match self.call(Op::LoadModel { model: model.into(), keep }).await? {
+        match self
+            .call(Op::LoadModel {
+                model: model.into(),
+                keep,
+            })
+            .await?
+        {
             Reply::Loaded { .. } => Ok(()),
             other => Err(unexpected(&other)),
         }
@@ -146,25 +201,50 @@ impl Client {
 
     /// Whether it actually unloaded (false while something else uses it).
     pub async fn unload_model(&self, model: &str) -> Result<bool> {
-        match self.call(Op::UnloadModel { model: model.into() }).await? {
+        match self
+            .call(Op::UnloadModel {
+                model: model.into(),
+            })
+            .await?
+        {
             Reply::Unloaded { unloaded, .. } => Ok(unloaded),
             other => Err(unexpected(&other)),
         }
     }
 
     pub async fn remove_model(&self, model: &str) -> Result<()> {
-        expect_ok(self.call(Op::RemoveModel { model: model.into() }).await?)
+        expect_ok(
+            self.call(Op::RemoveModel {
+                model: model.into(),
+            })
+            .await?,
+        )
     }
 
     pub async fn model_settings(&self, model: &str) -> Result<ModelSettings> {
-        match self.call(Op::ModelSettings { model: model.into() }).await? {
+        match self
+            .call(Op::ModelSettings {
+                model: model.into(),
+            })
+            .await?
+        {
             Reply::Settings(s) => Ok(s),
             other => Err(unexpected(&other)),
         }
     }
 
-    pub async fn configure_model(&self, model: &str, settings: BTreeMap<String, String>) -> Result<ModelSettings> {
-        match self.call(Op::ConfigureModel { model: model.into(), settings }).await? {
+    pub async fn configure_model(
+        &self,
+        model: &str,
+        settings: BTreeMap<String, String>,
+    ) -> Result<ModelSettings> {
+        match self
+            .call(Op::ConfigureModel {
+                model: model.into(),
+                settings,
+            })
+            .await?
+        {
             Reply::Settings(s) => Ok(s),
             other => Err(unexpected(&other)),
         }
@@ -172,11 +252,19 @@ impl Client {
 
     /// Streams `progress` events and ends with `ok`.
     pub async fn download_model(&self, model: &str) -> Result<Stream> {
-        self.stream(Op::DownloadModel { model: model.into() }).await
+        self.stream(Op::DownloadModel {
+            model: model.into(),
+        })
+        .await
     }
 
     pub async fn cancel_download(&self, model: &str) -> Result<()> {
-        expect_ok(self.call(Op::CancelDownload { model: model.into() }).await?)
+        expect_ok(
+            self.call(Op::CancelDownload {
+                model: model.into(),
+            })
+            .await?,
+        )
     }
 
     /// Check Hugging Face now; returns the models with updates.
@@ -198,14 +286,36 @@ impl Client {
         self.stream(Op::Chat(request)).await
     }
 
-    pub async fn embed(&self, model: &str, input: Vec<String>, priority: Priority) -> Result<Embeddings> {
-        self.embed_inputs(model, input.into_iter().map(EmbedInput::Text).collect(), priority).await
+    pub async fn embed(
+        &self,
+        model: &str,
+        input: Vec<String>,
+        priority: Priority,
+    ) -> Result<Embeddings> {
+        self.embed_inputs(
+            model,
+            input.into_iter().map(EmbedInput::Text).collect(),
+            priority,
+        )
+        .await
     }
 
     /// Embed text, images and audio together (one vector space with a model like
     /// EmbeddingGemma 2 and its projector).
-    pub async fn embed_inputs(&self, model: &str, input: Vec<EmbedInput>, priority: Priority) -> Result<Embeddings> {
-        match self.call(Op::Embed { model: model.into(), input, priority }).await? {
+    pub async fn embed_inputs(
+        &self,
+        model: &str,
+        input: Vec<EmbedInput>,
+        priority: Priority,
+    ) -> Result<Embeddings> {
+        match self
+            .call(Op::Embed {
+                model: model.into(),
+                input,
+                priority,
+            })
+            .await?
+        {
             Reply::Embeddings(e) => Ok(e),
             other => Err(unexpected(&other)),
         }
@@ -246,8 +356,21 @@ impl Client {
         }
     }
 
-    pub async fn configure_service(&self, max_loaded: Option<u32>, idle_unload_seconds: Option<i64>) -> Result<ServiceSettings> {
-        self.configure_service_with(Op::ConfigureService { max_loaded, idle_unload_seconds, model_updates: None, defaults: None, battery_saver: None, add_model_dirs: None, openai: None }).await
+    pub async fn configure_service(
+        &self,
+        max_loaded: Option<u32>,
+        idle_unload_seconds: Option<i64>,
+    ) -> Result<ServiceSettings> {
+        self.configure_service_with(Op::ConfigureService {
+            max_loaded,
+            idle_unload_seconds,
+            model_updates: None,
+            defaults: None,
+            battery_saver: None,
+            add_model_dirs: None,
+            openai: None,
+        })
+        .await
     }
 
     /// List models from `dirs` too (an app's own model folder). Needs a trusted program.
@@ -278,15 +401,29 @@ impl Client {
         match self.call(Op::ListActions { detail: true }).await {
             Ok(Reply::Actions { actions, apps }) => Ok((actions, apps.unwrap_or_default())),
             Ok(other) => Err(unexpected(&other)),
-            Err(e) if e.kind == ErrorKind::InvalidRequest => Ok((self.list_actions().await?, Vec::new())),
+            Err(e) if e.kind == ErrorKind::InvalidRequest => {
+                Ok((self.list_actions().await?, Vec::new()))
+            }
             Err(e) => Err(e),
         }
     }
 
     /// Run an action. Pass `confirmed` only after the person agreed in your UI; an
     /// action that asks first fails with `confirmation_required` otherwise.
-    pub async fn invoke_action(&self, action: &str, arguments: Value, confirmed: bool) -> Result<Value> {
-        match self.call(Op::InvokeAction { action: action.into(), arguments, confirmed }).await? {
+    pub async fn invoke_action(
+        &self,
+        action: &str,
+        arguments: Value,
+        confirmed: bool,
+    ) -> Result<Value> {
+        match self
+            .call(Op::InvokeAction {
+                action: action.into(),
+                arguments,
+                confirmed,
+            })
+            .await?
+        {
             Reply::ActionDone { result } => Ok(result),
             other => Err(unexpected(&other)),
         }
@@ -295,7 +432,11 @@ impl Client {
     /// Offer actions for as long as the returned server lives.
     pub async fn serve_actions(&self, actions: Vec<ActionSpec>) -> Result<ActionServer> {
         let stream = self.stream(Op::ServeActions { actions }).await?;
-        Ok(ActionServer { conn: stream.conn, next_id: 2, done: false })
+        Ok(ActionServer {
+            conn: stream.conn,
+            next_id: 2,
+            done: false,
+        })
     }
 
     /// Any of `configure_service`'s settings (`op` is an `Op::ConfigureService`).
@@ -317,7 +458,10 @@ fn expect_ok(reply: Reply) -> Result<()> {
 fn unexpected(what: &impl std::fmt::Debug) -> Error {
     let text = format!("{what:?}");
     let short: String = text.chars().take(120).collect();
-    Error::new(ErrorKind::Internal, format!("unexpected reply from Nyx AI Core: {short}"))
+    Error::new(
+        ErrorKind::Internal,
+        format!("unexpected reply from Nyx AI Core: {short}"),
+    )
 }
 
 struct Connection {
@@ -338,7 +482,10 @@ impl Connection {
         loop {
             let buf = self.reader.fill_buf().await.map_err(lost)?;
             if buf.is_empty() {
-                return Err(Error::new(ErrorKind::Unavailable, "Nyx AI Core closed the connection"));
+                return Err(Error::new(
+                    ErrorKind::Unavailable,
+                    "Nyx AI Core closed the connection",
+                ));
             }
             let (take, end) = match buf.iter().position(|b| *b == b'\n') {
                 Some(i) => (i + 1, true),
@@ -351,15 +498,22 @@ impl Connection {
             }
             if end {
                 let line = std::mem::take(&mut self.line);
-                return serde_json::from_slice(&line)
-                    .map_err(|e| Error::new(ErrorKind::Internal, format!("unreadable reply from Nyx AI Core: {e}")));
+                return serde_json::from_slice(&line).map_err(|e| {
+                    Error::new(
+                        ErrorKind::Internal,
+                        format!("unreadable reply from Nyx AI Core: {e}"),
+                    )
+                });
             }
         }
     }
 }
 
 fn lost(e: std::io::Error) -> Error {
-    Error::new(ErrorKind::Unavailable, format!("lost the connection to Nyx AI Core: {e}"))
+    Error::new(
+        ErrorKind::Unavailable,
+        format!("lost the connection to Nyx AI Core: {e}"),
+    )
 }
 
 /// One call to a served action.
@@ -388,8 +542,22 @@ impl ActionServer {
         }
         loop {
             match self.conn.read().await {
-                Ok(ServerLine::Event { id: 1, event: Event::Invoke { invocation, action, arguments, caller } }) => {
-                    return Some(Ok(Invocation { id: invocation, action, arguments, caller }));
+                Ok(ServerLine::Event {
+                    id: 1,
+                    event:
+                        Event::Invoke {
+                            invocation,
+                            action,
+                            arguments,
+                            caller,
+                        },
+                }) => {
+                    return Some(Ok(Invocation {
+                        id: invocation,
+                        action,
+                        arguments,
+                        caller,
+                    }));
                 }
                 Ok(ServerLine::Result { id: 1, .. }) => {
                     self.done = true;
@@ -409,14 +577,27 @@ impl ActionServer {
     }
 
     /// The outcome of call `invocation`: a value, or the reason it wasn't done.
-    pub async fn answer(&mut self, invocation: u64, outcome: std::result::Result<Value, String>) -> Result<()> {
+    pub async fn answer(
+        &mut self,
+        invocation: u64,
+        outcome: std::result::Result<Value, String>,
+    ) -> Result<()> {
         let (ok, error) = match outcome {
             Ok(value) => (Some(value), None),
             Err(e) => (None, Some(e)),
         };
         let id = self.next_id;
         self.next_id += 1;
-        self.conn.send(&ClientLine::Request(Box::new(Request { id, op: Op::ActionResult { invocation, ok, error } }))).await
+        self.conn
+            .send(&ClientLine::Request(Box::new(Request {
+                id,
+                op: Op::ActionResult {
+                    invocation,
+                    ok,
+                    error,
+                },
+            })))
+            .await
     }
 }
 
@@ -449,7 +630,9 @@ impl Stream {
                 }
             };
             match line {
-                ServerLine::Event { id, event } if id == self.id => return Some(Ok(Item::Event(event))),
+                ServerLine::Event { id, event } if id == self.id => {
+                    return Some(Ok(Item::Event(event)));
+                }
                 ServerLine::Result { id, result } if id == self.id => {
                     self.done = true;
                     return Some(Ok(Item::Done(result)));
@@ -469,7 +652,12 @@ impl Stream {
         if self.done {
             return Ok(());
         }
-        self.conn.send(&ClientLine::Request(Box::new(Request { id: self.id + 1, op: Op::Cancel { request: self.id } }))).await
+        self.conn
+            .send(&ClientLine::Request(Box::new(Request {
+                id: self.id + 1,
+                op: Op::Cancel { request: self.id },
+            })))
+            .await
     }
 
     /// Read a chat to its end.
@@ -477,7 +665,11 @@ impl Stream {
         let mut out = ChatOutcome::default();
         while let Some(item) = self.next().await {
             match item? {
-                Item::Event(Event::Delta { content, reasoning, tool_calls }) => {
+                Item::Event(Event::Delta {
+                    content,
+                    reasoning,
+                    tool_calls,
+                }) => {
                     out.content.push_str(&content);
                     out.reasoning.push_str(&reasoning);
                     out.add_tool_calls(&tool_calls);
@@ -490,7 +682,10 @@ impl Stream {
                 Item::Done(other) => return Err(unexpected(&other)),
             }
         }
-        Err(Error::new(ErrorKind::Unavailable, "the chat ended without a result"))
+        Err(Error::new(
+            ErrorKind::Unavailable,
+            "the chat ended without a result",
+        ))
     }
 }
 
@@ -548,7 +743,10 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use tokio::net::UnixListener;
 
-    async fn fake_server(path: PathBuf, reply: impl Fn(Request) -> Vec<ServerLine> + Send + 'static) {
+    async fn fake_server(
+        path: PathBuf,
+        reply: impl Fn(Request) -> Vec<ServerLine> + Send + 'static,
+    ) {
         let listener = UnixListener::bind(&path).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         tokio::spawn(async move {
@@ -579,25 +777,59 @@ mod tests {
         fake_server(path.clone(), |r| {
             let delta = |content: &str, tool_calls| ServerLine::Event {
                 id: r.id,
-                event: Event::Delta { content: content.into(), reasoning: String::new(), tool_calls },
+                event: Event::Delta {
+                    content: content.into(),
+                    reasoning: String::new(),
+                    tool_calls,
+                },
             };
             vec![
-                ServerLine::Event { id: r.id, event: Event::Accepted },
+                ServerLine::Event {
+                    id: r.id,
+                    event: Event::Accepted,
+                },
                 delta("Hel", vec![]),
                 delta(
                     "lo",
-                    vec![ToolCallDelta { index: 0, id: Some("c".into()), name: Some("calc".into()), arguments: Some("{".into()) }],
+                    vec![ToolCallDelta {
+                        index: 0,
+                        id: Some("c".into()),
+                        name: Some("calc".into()),
+                        arguments: Some("{".into()),
+                    }],
                 ),
-                delta("", vec![ToolCallDelta { index: 0, arguments: Some("}".into()), ..Default::default() }]),
-                ServerLine::Result { id: r.id, result: Reply::Finished(proto::Finished { finish_reason: "stop".into(), ..Default::default() }) },
+                delta(
+                    "",
+                    vec![ToolCallDelta {
+                        index: 0,
+                        arguments: Some("}".into()),
+                        ..Default::default()
+                    }],
+                ),
+                ServerLine::Result {
+                    id: r.id,
+                    result: Reply::Finished(proto::Finished {
+                        finish_reason: "stop".into(),
+                        ..Default::default()
+                    }),
+                },
             ]
         })
         .await;
         let client = Client::with_socket("test", &path);
         assert!(client.available());
-        let out = client.chat(ChatRequest::default()).await.unwrap().collect_chat().await.unwrap();
+        let out = client
+            .chat(ChatRequest::default())
+            .await
+            .unwrap()
+            .collect_chat()
+            .await
+            .unwrap();
         assert_eq!(out.content, "Hello");
-        assert_eq!(out.tool_calls, vec![("c".into(), "calc".into(), "{}".into())]);
+        assert_eq!(
+            out.tool_calls,
+            vec![("c".into(), "calc".into(), "{}".into())]
+        );
         assert_eq!(out.finished.finish_reason, "stop");
     }
 
@@ -606,14 +838,26 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ai.sock");
         fake_server(path.clone(), |r| {
-            vec![ServerLine::Error { id: Some(r.id), error: Error::new(ErrorKind::UnknownModel, "no such model") }]
+            vec![ServerLine::Error {
+                id: Some(r.id),
+                error: Error::new(ErrorKind::UnknownModel, "no such model"),
+            }]
         })
         .await;
         let client = Client::with_socket("test", &path);
-        assert_eq!(client.model_info("x").await.unwrap_err().kind, ErrorKind::UnknownModel);
+        assert_eq!(
+            client.model_info("x").await.unwrap_err().kind,
+            ErrorKind::UnknownModel
+        );
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
-        assert_eq!(client.list_models().await.unwrap_err().kind, ErrorKind::PermissionDenied);
+        assert_eq!(
+            client.list_models().await.unwrap_err().kind,
+            ErrorKind::PermissionDenied
+        );
         let missing = Client::with_socket("test", dir.path().join("none.sock"));
-        assert_eq!(missing.list_models().await.unwrap_err().kind, ErrorKind::Unavailable);
+        assert_eq!(
+            missing.list_models().await.unwrap_err().kind,
+            ErrorKind::Unavailable
+        );
     }
 }

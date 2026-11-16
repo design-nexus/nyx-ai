@@ -45,7 +45,10 @@ impl Default for Settings {
         Settings {
             max_loaded: 1,
             idle_unload_seconds: 900,
-            model_dirs: vec!["~/.local/share/nyx-ai/models".into(), "~/.local/share/nyx-assistant/models".into()],
+            model_dirs: vec![
+                "~/.local/share/nyx-ai/models".into(),
+                "~/.local/share/nyx-assistant/models".into(),
+            ],
             worker: None,
             // Off until someone turns it on for coding tools (nyx-ai service openai=on).
             openai_endpoint: String::new(),
@@ -103,9 +106,13 @@ impl Settings {
             self.model_updates = "auto".into();
         }
         self.update_check_hours = self.update_check_hours.clamp(1, 24 * 30);
-        self.sidecars.retain(|k| crate::hf::SIDECARS.contains(&k.as_str()));
+        self.sidecars
+            .retain(|k| crate::hf::SIDECARS.contains(&k.as_str()));
         self.sidecars.dedup();
-        self.defaults.retain(|role, model| nyx_ai_proto::ROLES.contains(&role.as_str()) && nyx_ai_proto::valid_model_id(model).is_ok());
+        self.defaults.retain(|role, model| {
+            nyx_ai_proto::ROLES.contains(&role.as_str())
+                && nyx_ai_proto::valid_model_id(model).is_ok()
+        });
         self
     }
 
@@ -138,10 +145,18 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::under(dir.path());
         std::fs::create_dir_all(paths.config_home.join("nyx-chat")).unwrap();
-        std::fs::write(paths.config_home.join("nyx-chat/settings.toml"), "llama_models_max = 2\nllama_idle_seconds = -1\n").unwrap();
+        std::fs::write(
+            paths.config_home.join("nyx-chat/settings.toml"),
+            "llama_models_max = 2\nllama_idle_seconds = -1\n",
+        )
+        .unwrap();
         let s = Settings::load(&paths);
         assert_eq!((s.max_loaded, s.idle_unload_seconds), (2, -1));
-        std::fs::write(paths.config_home.join("nyx-chat/settings.toml"), "llama_models_max = 4\n").unwrap();
+        std::fs::write(
+            paths.config_home.join("nyx-chat/settings.toml"),
+            "llama_models_max = 4\n",
+        )
+        .unwrap();
         assert_eq!(Settings::load(&paths).max_loaded, 2);
     }
 
@@ -167,12 +182,35 @@ mod tests {
 
     #[test]
     fn clamps() {
-        let s = Settings { max_loaded: 99, idle_unload_seconds: -7, ..Default::default() }.clamped();
-        assert_eq!((s.max_loaded, s.idle_unload_seconds), (MAX_LOADED_LIMIT, -1));
-        let s = Settings { model_updates: "sometimes".into(), update_check_hours: 0, sidecars: vec!["mtp".into(), "x".into()], ..Default::default() }
-            .clamped();
-        assert_eq!((s.model_updates.as_str(), s.update_check_hours, s.sidecars.as_slice()), ("auto", 1, &["mtp".to_string()][..]));
+        let s = Settings {
+            max_loaded: 99,
+            idle_unload_seconds: -7,
+            ..Default::default()
+        }
+        .clamped();
+        assert_eq!(
+            (s.max_loaded, s.idle_unload_seconds),
+            (MAX_LOADED_LIMIT, -1)
+        );
+        let s = Settings {
+            model_updates: "sometimes".into(),
+            update_check_hours: 0,
+            sidecars: vec!["mtp".into(), "x".into()],
+            ..Default::default()
+        }
+        .clamped();
+        assert_eq!(
+            (
+                s.model_updates.as_str(),
+                s.update_check_hours,
+                s.sidecars.as_slice()
+            ),
+            ("auto", 1, &["mtp".to_string()][..])
+        );
         let old: Settings = toml::from_str("max_loaded = 2\n").unwrap();
-        assert_eq!((old.model_updates.as_str(), old.sidecars.len()), ("auto", 2));
+        assert_eq!(
+            (old.model_updates.as_str(), old.sidecars.len()),
+            ("auto", 2)
+        );
     }
 }

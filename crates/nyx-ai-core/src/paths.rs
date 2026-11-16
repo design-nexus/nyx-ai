@@ -23,7 +23,9 @@ pub struct Paths {
 }
 
 fn env_dir(name: &str) -> Option<PathBuf> {
-    std::env::var_os(name).filter(|v| !v.is_empty()).map(PathBuf::from)
+    std::env::var_os(name)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 pub fn home() -> PathBuf {
@@ -41,7 +43,9 @@ pub fn hub_cache() -> PathBuf {
     if let Some(path) = env_dir("HF_HOME") {
         return path.join("hub");
     }
-    env_dir("XDG_CACHE_HOME").unwrap_or_else(|| home().join(".cache")).join("huggingface/hub")
+    env_dir("XDG_CACHE_HOME")
+        .unwrap_or_else(|| home().join(".cache"))
+        .join("huggingface/hub")
 }
 
 impl Paths {
@@ -53,11 +57,16 @@ impl Paths {
         let socket = env_dir(nyx_ai_proto::SOCKET_ENV).unwrap_or_else(|| {
             env_dir("XDG_RUNTIME_DIR")
                 // SAFETY: getuid has no preconditions.
-                .unwrap_or_else(|| PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() })))
+                .unwrap_or_else(|| {
+                    PathBuf::from(format!("/run/user/{}", unsafe { libc::getuid() }))
+                })
                 .join("nyx-ai")
                 .join(nyx_ai_proto::SOCKET_NAME)
         });
-        let runtime = socket.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"));
+        let runtime = socket
+            .parent()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
         Paths {
             config: config_home.join("nyx-ai"),
             state: state_home.join("nyx-ai"),

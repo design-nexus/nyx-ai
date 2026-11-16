@@ -2,7 +2,8 @@
 //! list, chat, embeddings, eviction, cancel, crash recovery and settings.
 
 use nyx_ai_client::proto::{
-    ActionSpec, ChatRequest, Confirmation, EmbedInput, SideEffects, ClientLine, ErrorKind, Event, Hello, Message, ModelState, Op, Priority, Role, ServerLine, encode,
+    ActionSpec, ChatRequest, ClientLine, Confirmation, EmbedInput, ErrorKind, Event, Hello,
+    Message, ModelState, Op, Priority, Role, ServerLine, SideEffects, encode,
 };
 use nyx_ai_client::{Client, Item};
 use nyx_ai_core::paths::Paths;
@@ -47,17 +48,26 @@ fn chat_file() -> Vec<u8> {
     gguf(&[
         ("general.architecture", Value::Str("gemma4")),
         ("general.file_type", Value::U32(15)),
-        ("tokenizer.chat_template", Value::Str("{% if tools %}{% endif %}{{ enable_thinking }}")),
+        (
+            "tokenizer.chat_template",
+            Value::Str("{% if tools %}{% endif %}{{ enable_thinking }}"),
+        ),
         ("gemma4.context_length", Value::U32(8192)),
     ])
 }
 
 fn embed_file() -> Vec<u8> {
-    gguf(&[("general.architecture", Value::Str("gemma-embedding")), ("gemma-embedding.pooling_type", Value::U32(1))])
+    gguf(&[
+        ("general.architecture", Value::Str("gemma-embedding")),
+        ("gemma-embedding.pooling_type", Value::U32(1)),
+    ])
 }
 
 fn cached(paths: &Paths, repo: &str, file: &str, bytes: &[u8]) {
-    let dir = paths.cache.join(format!("models--{}", repo.replace('/', "--"))).join("snapshots/0123456789abcdef0123456789abcdef01234567");
+    let dir = paths
+        .cache
+        .join(format!("models--{}", repo.replace('/', "--")))
+        .join("snapshots/0123456789abcdef0123456789abcdef01234567");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(file), bytes).unwrap();
 }
@@ -77,7 +87,11 @@ impl Harness {
 
     /// `settings`: extra lines for settings.toml; `hub`: a fake Hugging Face;
     /// `power`: a fake /sys/class/power_supply.
-    async fn start_with(settings: &str, hub: Option<String>, power: Option<std::path::PathBuf>) -> Harness {
+    async fn start_with(
+        settings: &str,
+        hub: Option<String>,
+        power: Option<std::path::PathBuf>,
+    ) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let paths = Paths::under(dir.path());
         let folder = dir.path().join("models");
@@ -86,7 +100,10 @@ impl Harness {
         std::fs::create_dir_all(&paths.config).unwrap();
         std::fs::write(
             paths.settings(),
-            format!("max_loaded = 1\nidle_unload_seconds = -1\nmodel_dirs = [{:?}]\n{settings}", folder.display().to_string()),
+            format!(
+                "max_loaded = 1\nidle_unload_seconds = -1\nmodel_dirs = [{:?}]\n{settings}",
+                folder.display().to_string()
+            ),
         )
         .unwrap();
         cached(&paths, "org/chat", "chat-Q4_K_M.gguf", &chat_file());
@@ -106,9 +123,19 @@ impl Harness {
         let service = Service::new(paths.clone(), options);
         let stop = CancellationToken::new();
         service.run_background(stop.clone());
-        tokio::spawn(nyx_ai_core::server::serve(service.clone(), listener, stop.clone()));
+        tokio::spawn(nyx_ai_core::server::serve(
+            service.clone(),
+            listener,
+            stop.clone(),
+        ));
         let client = Client::with_socket("nyx-test", &paths.socket);
-        Harness { _dir: dir, paths, service, client, stop }
+        Harness {
+            _dir: dir,
+            paths,
+            service,
+            client,
+            stop,
+        }
     }
 
     async fn stop(self) {
@@ -118,7 +145,12 @@ impl Harness {
 }
 
 fn ask(model: &str, text: &str) -> ChatRequest {
-    ChatRequest { model: model.into(), messages: vec![Message::text(Role::User, text)], priority: Priority::Interactive, ..Default::default() }
+    ChatRequest {
+        model: model.into(),
+        messages: vec![Message::text(Role::User, text)],
+        priority: Priority::Interactive,
+        ..Default::default()
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -126,13 +158,26 @@ async fn lists_models_and_chats() {
     let h = Harness::start().await;
     let models = h.client.list_models().await.unwrap();
     let ids: Vec<&str> = models.iter().map(|m| m.id.as_str()).collect();
-    assert_eq!(ids, ["local-chat-Q8_0", "org/broken:Q4_K_M", "org/chat:Q4_K_M", "org/embed:Q8_0", "org/other:Q4_K_M"]);
+    assert_eq!(
+        ids,
+        [
+            "local-chat-Q8_0",
+            "org/broken:Q4_K_M",
+            "org/chat:Q4_K_M",
+            "org/embed:Q8_0",
+            "org/other:Q4_K_M"
+        ]
+    );
     let chat = models.iter().find(|m| m.id == "org/chat:Q4_K_M").unwrap();
     assert_eq!(chat.state, ModelState::Installed);
     assert!(chat.removable && chat.quantization.as_deref() == Some("Q4_K_M"));
     assert!(!models[0].removable);
 
-    let mut stream = h.client.chat(ask("org/chat:Q4_K_M", "hello")).await.unwrap();
+    let mut stream = h
+        .client
+        .chat(ask("org/chat:Q4_K_M", "hello"))
+        .await
+        .unwrap();
     let mut seen = Vec::new();
     let mut text = String::new();
     let finished = loop {
@@ -145,52 +190,156 @@ async fn lists_models_and_chats() {
     };
     assert_eq!(text, "tok0 tok1 tok2 tok3 tok4 ");
     assert_eq!(seen[0], Event::Accepted);
-    assert!(seen.contains(&Event::ModelLoading { model: "org/chat:Q4_K_M".into() }));
+    assert!(seen.contains(&Event::ModelLoading {
+        model: "org/chat:Q4_K_M".into()
+    }));
     assert_eq!(*seen.last().unwrap(), Event::Started);
-    assert_eq!((finished.finish_reason.as_str(), finished.usage.completion_tokens), ("stop", 5));
+    assert_eq!(
+        (
+            finished.finish_reason.as_str(),
+            finished.usage.completion_tokens
+        ),
+        ("stop", 5)
+    );
     assert!(finished.timings.load_ms > 0);
 
     let status = h.client.resource_status().await.unwrap();
     assert_eq!(status.loaded.len(), 1);
     assert_eq!(status.loaded[0].slots, 2);
     let listed = h.client.list_models().await.unwrap();
-    assert_eq!(listed.iter().find(|m| m.id == "org/chat:Q4_K_M").unwrap().state, ModelState::Ready);
+    assert_eq!(
+        listed
+            .iter()
+            .find(|m| m.id == "org/chat:Q4_K_M")
+            .unwrap()
+            .state,
+        ModelState::Ready
+    );
     h.stop().await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn embeddings_evict_the_chat_model_and_check_capabilities() {
     let h = Harness::start().await;
-    let out = h.client.chat(ask("org/chat:Q4_K_M", "hi")).await.unwrap().collect_chat().await.unwrap();
+    let out = h
+        .client
+        .chat(ask("org/chat:Q4_K_M", "hi"))
+        .await
+        .unwrap()
+        .collect_chat()
+        .await
+        .unwrap();
     assert!(!out.content.is_empty());
-    let e = h.client.embed("org/embed:Q8_0", vec!["a".into(), "abcd".into()], Priority::Background).await.unwrap();
+    let e = h
+        .client
+        .embed(
+            "org/embed:Q8_0",
+            vec!["a".into(), "abcd".into()],
+            Priority::Background,
+        )
+        .await
+        .unwrap();
     assert_eq!((e.vectors.len(), e.dimensions), (2, 8));
     assert_eq!((e.vectors[0][0], e.vectors[1][0]), (1.0, 4.0));
     assert_eq!(e.identity.file, "embed-Q8_0.gguf");
-    assert_eq!(e.identity.revision.as_deref(), Some("0123456789abcdef0123456789abcdef01234567"));
-    assert_eq!(e.identity.projector.as_deref(), Some("mmproj-embed-Q8_0.gguf"));
+    assert_eq!(
+        e.identity.revision.as_deref(),
+        Some("0123456789abcdef0123456789abcdef01234567")
+    );
+    assert_eq!(
+        e.identity.projector.as_deref(),
+        Some("mmproj-embed-Q8_0.gguf")
+    );
 
-    let media = vec![EmbedInput::from("abc"), EmbedInput::Image { image: "aGVsbG8=".into() }, EmbedInput::Audio { audio: "data:audio/wav;base64,aGk=".into() }];
-    let e = h.client.embed_inputs("org/embed:Q8_0", media, Priority::Normal).await.unwrap();
-    assert_eq!(e.vectors.iter().map(|v| v[0]).collect::<Vec<_>>(), [3.0, 1000.0, 1000.0]);
-    let bad = h.client.embed_inputs("org/embed:Q8_0", vec![EmbedInput::Image { image: "not base64!".into() }], Priority::Normal).await;
+    let media = vec![
+        EmbedInput::from("abc"),
+        EmbedInput::Image {
+            image: "aGVsbG8=".into(),
+        },
+        EmbedInput::Audio {
+            audio: "data:audio/wav;base64,aGk=".into(),
+        },
+    ];
+    let e = h
+        .client
+        .embed_inputs("org/embed:Q8_0", media, Priority::Normal)
+        .await
+        .unwrap();
+    assert_eq!(
+        e.vectors.iter().map(|v| v[0]).collect::<Vec<_>>(),
+        [3.0, 1000.0, 1000.0]
+    );
+    let bad = h
+        .client
+        .embed_inputs(
+            "org/embed:Q8_0",
+            vec![EmbedInput::Image {
+                image: "not base64!".into(),
+            }],
+            Priority::Normal,
+        )
+        .await;
     assert_eq!(bad.unwrap_err().kind, ErrorKind::InvalidRequest);
-    let pictures = h.client.embed_inputs("org/chat:Q4_K_M", vec![EmbedInput::Image { image: "aGk=".into() }], Priority::Normal).await;
+    let pictures = h
+        .client
+        .embed_inputs(
+            "org/chat:Q4_K_M",
+            vec![EmbedInput::Image {
+                image: "aGk=".into(),
+            }],
+            Priority::Normal,
+        )
+        .await;
     assert_eq!(pictures.unwrap_err().kind, ErrorKind::UnsupportedCapability);
     let status = h.client.resource_status().await.unwrap();
-    assert_eq!(status.loaded.iter().map(|m| m.id.as_str()).collect::<Vec<_>>(), ["org/embed:Q8_0"]);
+    assert_eq!(
+        status
+            .loaded
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        ["org/embed:Q8_0"]
+    );
     assert_eq!(h.client.worker_status().await.unwrap().metrics.evictions, 1);
 
-    let err = h.client.chat(ask("org/embed:Q8_0", "hi")).await.unwrap().collect_chat().await.unwrap_err();
+    let err = h
+        .client
+        .chat(ask("org/embed:Q8_0", "hi"))
+        .await
+        .unwrap()
+        .collect_chat()
+        .await
+        .unwrap_err();
     assert_eq!(err.kind, ErrorKind::UnsupportedCapability);
-    let err = h.client.embed("org/chat:Q4_K_M", vec!["x".into()], Priority::Normal).await.unwrap_err();
+    let err = h
+        .client
+        .embed("org/chat:Q4_K_M", vec!["x".into()], Priority::Normal)
+        .await
+        .unwrap_err();
     assert_eq!(err.kind, ErrorKind::UnsupportedCapability);
-    let err = h.client.chat(ask("org/missing:Q4_0", "hi")).await.unwrap().collect_chat().await.unwrap_err();
+    let err = h
+        .client
+        .chat(ask("org/missing:Q4_0", "hi"))
+        .await
+        .unwrap()
+        .collect_chat()
+        .await
+        .unwrap_err();
     assert_eq!(err.kind, ErrorKind::UnknownModel);
-    let err = h.client.chat(ask("org/broken:Q4_K_M", "hi")).await.unwrap().collect_chat().await.unwrap_err();
+    let err = h
+        .client
+        .chat(ask("org/broken:Q4_K_M", "hi"))
+        .await
+        .unwrap()
+        .collect_chat()
+        .await
+        .unwrap_err();
     assert_eq!(err.kind, ErrorKind::ModelLoadFailed);
     let router = std::fs::read_to_string(h.paths.router_ini()).unwrap();
-    assert!(router.contains("[org/embed:Q8_0]\nembeddings = true"), "{router}");
+    assert!(
+        router.contains("[org/embed:Q8_0]\nembeddings = true"),
+        "{router}"
+    );
     h.stop().await;
 }
 
@@ -204,17 +353,40 @@ async fn chat_assistant_and_glimpse_share_ai_core() {
     let chat = Client::with_socket("nyx-chat", &h.paths.socket);
     let assistant = Client::with_socket("nyx-assistant", &h.paths.socket);
     let glimpse = Client::with_socket("nyx-glimpse", &h.paths.socket);
-    let ask_long = |text: &str| ChatRequest { model: "org/chat:Q4_K_M".into(), messages: vec![Message::text(Role::User, text)], priority: Priority::Interactive, ..Default::default() };
+    let ask_long = |text: &str| ChatRequest {
+        model: "org/chat:Q4_K_M".into(),
+        messages: vec![Message::text(Role::User, text)],
+        priority: Priority::Interactive,
+        ..Default::default()
+    };
     // Chat's reply is under way before the others arrive.
     let mut chat_stream = chat.chat(ask_long("count:40")).await.unwrap();
-    while !matches!(chat_stream.next().await.unwrap().unwrap(), Item::Event(Event::Delta { .. })) {}
+    while !matches!(
+        chat_stream.next().await.unwrap().unwrap(),
+        Item::Event(Event::Delta { .. })
+    ) {}
     let indexing = tokio::spawn({
         let glimpse = glimpse.clone();
-        async move { glimpse.embed("org/embed:Q8_0", vec!["notes".into(), "photos".into()], Priority::Background).await }
+        async move {
+            glimpse
+                .embed(
+                    "org/embed:Q8_0",
+                    vec!["notes".into(), "photos".into()],
+                    Priority::Background,
+                )
+                .await
+        }
     });
     let spoken = tokio::spawn({
         let assistant = assistant.clone();
-        async move { assistant.chat(ask("org/chat:Q4_K_M", "what's next")).await.unwrap().collect_chat().await }
+        async move {
+            assistant
+                .chat(ask("org/chat:Q4_K_M", "what's next"))
+                .await
+                .unwrap()
+                .collect_chat()
+                .await
+        }
     });
     let mut chat_text = String::new();
     let chat_done = loop {
@@ -224,23 +396,55 @@ async fn chat_assistant_and_glimpse_share_ai_core() {
             Item::Done(reply) => break reply,
         }
     };
-    assert!(matches!(chat_done, nyx_ai_client::proto::Reply::Finished(_)), "Chat's reply finished whole");
+    assert!(
+        matches!(chat_done, nyx_ai_client::proto::Reply::Finished(_)),
+        "Chat's reply finished whole"
+    );
     let answer = spoken.await.unwrap().unwrap();
     assert!(!answer.content.is_empty(), "the Assistant's turn finished");
     let vectors = indexing.await.unwrap().unwrap();
-    assert_eq!(vectors.vectors.len(), 2, "Glimpse's indexing ran after the chats");
+    assert_eq!(
+        vectors.vectors.len(),
+        2,
+        "Glimpse's indexing ran after the chats"
+    );
     let m = h.client.worker_status().await.unwrap().metrics;
-    assert!(m.evictions >= 1, "one model at a time: the embedding model replaced the chat model once it was free");
+    assert!(
+        m.evictions >= 1,
+        "one model at a time: the embedding model replaced the chat model once it was free"
+    );
     // Cancelling is per connection: the Assistant can't cancel Chat's request.
     let mut chat_again = chat.chat(ask_long("count:200")).await.unwrap();
-    while !matches!(chat_again.next().await.unwrap().unwrap(), Item::Event(Event::Delta { .. })) {}
-    let stranger = raw(&h.paths.socket, &[
-        encode(&ClientLine::Hello(Hello { api_version: nyx_ai_client::proto::API_VERSION, client: "nyx-assistant".into() })),
-        encode(&ClientLine::Request(Box::new(nyx_ai_client::proto::Request { id: 9, op: Op::Cancel { request: 1 } }))),
-    ])
+    while !matches!(
+        chat_again.next().await.unwrap().unwrap(),
+        Item::Event(Event::Delta { .. })
+    ) {}
+    let stranger = raw(
+        &h.paths.socket,
+        &[
+            encode(&ClientLine::Hello(Hello {
+                api_version: nyx_ai_client::proto::API_VERSION,
+                client: "nyx-assistant".into(),
+            })),
+            encode(&ClientLine::Request(Box::new(
+                nyx_ai_client::proto::Request {
+                    id: 9,
+                    op: Op::Cancel { request: 1 },
+                },
+            ))),
+        ],
+    )
     .await;
-    assert!(!stranger.iter().any(|l| matches!(l, ServerLine::Error { error, .. } if error.kind == ErrorKind::Cancelled)));
-    assert!(matches!(chat_again.next().await, Some(Ok(Item::Event(Event::Delta { .. })))), "Chat's reply goes on");
+    assert!(!stranger.iter().any(
+        |l| matches!(l, ServerLine::Error { error, .. } if error.kind == ErrorKind::Cancelled)
+    ));
+    assert!(
+        matches!(
+            chat_again.next().await,
+            Some(Ok(Item::Event(Event::Delta { .. })))
+        ),
+        "Chat's reply goes on"
+    );
     chat_again.cancel().await.unwrap();
     h.stop().await;
 }
@@ -248,7 +452,11 @@ async fn chat_assistant_and_glimpse_share_ai_core() {
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_and_disconnect_stop_generation() {
     let h = Harness::start().await;
-    let mut stream = h.client.chat(ask("org/chat:Q4_K_M", "count:500")).await.unwrap();
+    let mut stream = h
+        .client
+        .chat(ask("org/chat:Q4_K_M", "count:500"))
+        .await
+        .unwrap();
     loop {
         if let Item::Event(Event::Delta { .. }) = stream.next().await.unwrap().unwrap() {
             break;
@@ -263,8 +471,15 @@ async fn cancel_and_disconnect_stop_generation() {
     };
     assert_eq!(err.kind, ErrorKind::Cancelled);
 
-    let mut dropped = h.client.chat(ask("org/chat:Q4_K_M", "count:500")).await.unwrap();
-    while !matches!(dropped.next().await.unwrap().unwrap(), Item::Event(Event::Delta { .. })) {}
+    let mut dropped = h
+        .client
+        .chat(ask("org/chat:Q4_K_M", "count:500"))
+        .await
+        .unwrap();
+    while !matches!(
+        dropped.next().await.unwrap().unwrap(),
+        Item::Event(Event::Delta { .. })
+    ) {}
     drop(dropped);
     let mut idle = false;
     for _ in 0..50 {
@@ -283,11 +498,25 @@ async fn cancel_and_disconnect_stop_generation() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_worker_crash_fails_the_request_and_recovers() {
     let h = Harness::start().await;
-    let err = h.client.chat(ask("org/chat:Q4_K_M", "crash")).await.unwrap().collect_chat().await.unwrap_err();
+    let err = h
+        .client
+        .chat(ask("org/chat:Q4_K_M", "crash"))
+        .await
+        .unwrap()
+        .collect_chat()
+        .await
+        .unwrap_err();
     assert_eq!(err.kind, ErrorKind::WorkerFailed, "{err:?}");
     let mut recovered = None;
     for _ in 0..60 {
-        if let Ok(out) = h.client.chat(ask("org/chat:Q4_K_M", "again")).await.unwrap().collect_chat().await {
+        if let Ok(out) = h
+            .client
+            .chat(ask("org/chat:Q4_K_M", "again"))
+            .await
+            .unwrap()
+            .collect_chat()
+            .await
+        {
             recovered = Some(out);
             break;
         }
@@ -302,26 +531,62 @@ async fn a_worker_crash_fails_the_request_and_recovers() {
 #[tokio::test(flavor = "multi_thread")]
 async fn settings_pins_and_removal() {
     let h = Harness::start().await;
-    let s = h.client.configure_model("org/chat:Q4_K_M", [("ctx-size".to_string(), "4096".to_string())].into()).await.unwrap();
+    let s = h
+        .client
+        .configure_model(
+            "org/chat:Q4_K_M",
+            [("ctx-size".to_string(), "4096".to_string())].into(),
+        )
+        .await
+        .unwrap();
     assert_eq!(s.values["ctx-size"], "4096");
     assert_eq!(s.effective["n-gpu-layers"], "auto");
-    let bad = h.client.configure_model("org/chat:Q4_K_M", [("model".to_string(), "/etc/passwd".to_string())].into()).await.unwrap_err();
+    let bad = h
+        .client
+        .configure_model(
+            "org/chat:Q4_K_M",
+            [("model".to_string(), "/etc/passwd".to_string())].into(),
+        )
+        .await
+        .unwrap_err();
     assert_eq!(bad.kind, ErrorKind::InvalidRequest);
-    assert!(std::fs::read_to_string(h.paths.models_ini()).unwrap().contains("ctx-size = 4096"));
+    assert!(
+        std::fs::read_to_string(h.paths.models_ini())
+            .unwrap()
+            .contains("ctx-size = 4096")
+    );
     let router = std::fs::read_to_string(h.paths.router_ini()).unwrap();
     assert!(router.contains("[local-chat-Q8_0]\nmodel = "), "{router}");
 
     h.client.load_model("org/chat:Q4_K_M", true).await.unwrap();
-    assert!(h.client.list_models().await.unwrap().iter().any(|m| m.id == "org/chat:Q4_K_M" && m.pinned));
+    assert!(
+        h.client
+            .list_models()
+            .await
+            .unwrap()
+            .iter()
+            .any(|m| m.id == "org/chat:Q4_K_M" && m.pinned)
+    );
     assert!(h.client.unload_model("org/chat:Q4_K_M").await.unwrap());
 
     h.client.remove_model("org/other:Q4_K_M").await.unwrap();
-    assert!(!h.client.list_models().await.unwrap().iter().any(|m| m.id == "org/other:Q4_K_M"));
+    assert!(
+        !h.client
+            .list_models()
+            .await
+            .unwrap()
+            .iter()
+            .any(|m| m.id == "org/other:Q4_K_M")
+    );
     let err = h.client.remove_model("local-chat-Q8_0").await.unwrap_err();
     assert_eq!(err.kind, ErrorKind::PermissionDenied);
     assert!(h._dir.path().join("models/local-chat-Q8_0.gguf").exists());
 
-    let service = h.client.configure_service(Some(2), Some(300)).await.unwrap();
+    let service = h
+        .client
+        .configure_service(Some(2), Some(300))
+        .await
+        .unwrap();
     assert_eq!((service.max_loaded, service.idle_unload_seconds), (2, 300));
     assert!(h.client.configure_service(Some(99), None).await.is_err());
 
@@ -332,16 +597,40 @@ async fn settings_pins_and_removal() {
     let dir = own.display().to_string();
     let s = h.client.add_model_dirs(vec![dir.clone()]).await.unwrap();
     assert!(s.model_dirs.contains(&dir));
-    assert!(h.client.list_models().await.unwrap().iter().any(|m| m.id == "app-embed-Q8_0" && !m.removable));
+    assert!(
+        h.client
+            .list_models()
+            .await
+            .unwrap()
+            .iter()
+            .any(|m| m.id == "app-embed-Q8_0" && !m.removable)
+    );
     let again = h.client.add_model_dirs(vec![dir.clone()]).await.unwrap();
     assert_eq!(again.model_dirs.iter().filter(|d| **d == dir).count(), 1);
     for bad in ["relative/models", "/no/such/folder", "~/../etc"] {
-        assert_eq!(h.client.add_model_dirs(vec![bad.into()]).await.unwrap_err().kind, ErrorKind::InvalidRequest, "{bad}");
+        assert_eq!(
+            h.client
+                .add_model_dirs(vec![bad.into()])
+                .await
+                .unwrap_err()
+                .kind,
+            ErrorKind::InvalidRequest,
+            "{bad}"
+        );
     }
 
-    let untrusted = Caller { name: "untrusted:x".into(), trusted: false, connection: 0 };
-    let op = Op::RemoveModel { model: "org/chat:Q4_K_M".into() };
-    assert_eq!(h.service.authorize(&untrusted, &op).unwrap_err().kind, ErrorKind::PermissionDenied);
+    let untrusted = Caller {
+        name: "untrusted:x".into(),
+        trusted: false,
+        connection: 0,
+    };
+    let op = Op::RemoveModel {
+        model: "org/chat:Q4_K_M".into(),
+    };
+    assert_eq!(
+        h.service.authorize(&untrusted, &op).unwrap_err().kind,
+        ErrorKind::PermissionDenied
+    );
     assert!(h.service.authorize(&untrusted, &Op::ListModels {}).is_ok());
     h.stop().await;
 }
@@ -352,35 +641,116 @@ async fn openai_endpoint_for_coding_tools() {
     let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     tcp.set_nonblocking(true).unwrap();
     let base = format!("http://{}", tcp.local_addr().unwrap());
-    tokio::spawn(nyx_ai_core::openai::serve(h.service.clone(), tcp, h.stop.clone()));
+    tokio::spawn(nyx_ai_core::openai::serve(
+        h.service.clone(),
+        tcp,
+        h.stop.clone(),
+    ));
 
     // Without the key, from a web page's Host, or with a form body: refused.
     let plain = reqwest::Client::new();
-    assert_eq!(plain.get(format!("{base}/v1/models")).send().await.unwrap().status(), 401, "no key yet");
+    assert_eq!(
+        plain
+            .get(format!("{base}/v1/models"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401,
+        "no key yet"
+    );
     let key = h.service.ensure_openai_key().unwrap();
-    assert_eq!(h.service.ensure_openai_key().unwrap(), key, "the key stays the same");
+    assert_eq!(
+        h.service.ensure_openai_key().unwrap(),
+        key,
+        "the key stays the same"
+    );
     let file = h.paths.config.join("api-key");
     assert_eq!(std::fs::read_to_string(&file).unwrap().trim(), key);
     use std::os::unix::fs::PermissionsExt;
-    assert_eq!(std::fs::metadata(&file).unwrap().permissions().mode() & 0o777, 0o600);
-    assert_eq!(plain.get(format!("{base}/v1/models")).send().await.unwrap().status(), 401);
-    let wrong = plain.get(format!("{base}/v1/models")).bearer_auth("nyx-0000").send().await.unwrap();
+    assert_eq!(
+        std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        plain
+            .get(format!("{base}/v1/models"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        401
+    );
+    let wrong = plain
+        .get(format!("{base}/v1/models"))
+        .bearer_auth("nyx-0000")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(wrong.status(), 401);
-    let rebound = plain.get(format!("{base}/v1/models")).bearer_auth(&key).header("host", "evil.example:8080").send().await.unwrap();
+    let rebound = plain
+        .get(format!("{base}/v1/models"))
+        .bearer_auth(&key)
+        .header("host", "evil.example:8080")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(rebound.status(), 403);
-    let form = plain.post(format!("{base}/v1/chat/completions")).bearer_auth(&key).header("content-type", "text/plain").body("{}").send().await.unwrap();
+    let form = plain
+        .post(format!("{base}/v1/chat/completions"))
+        .bearer_auth(&key)
+        .header("content-type", "text/plain")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
     assert_eq!(form.status(), 415);
-    assert_eq!(plain.get(format!("{base}/health")).send().await.unwrap().status(), 200);
+    assert_eq!(
+        plain
+            .get(format!("{base}/health"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
 
     let auth = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}")).unwrap();
-    let http = reqwest::Client::builder().default_headers([(reqwest::header::AUTHORIZATION, auth)].into_iter().collect()).build().unwrap();
+    let http = reqwest::Client::builder()
+        .default_headers(
+            [(reqwest::header::AUTHORIZATION, auth)]
+                .into_iter()
+                .collect(),
+        )
+        .build()
+        .unwrap();
 
-    let models: serde_json::Value = http.get(format!("{base}/v1/models")).send().await.unwrap().json().await.unwrap();
-    let ids: Vec<&str> = models["data"].as_array().unwrap().iter().filter_map(|m| m["id"].as_str()).collect();
-    assert!(ids.contains(&"org/chat:Q4_K_M") && ids.contains(&"org/embed:Q8_0"), "{ids:?}");
+    let models: serde_json::Value = http
+        .get(format!("{base}/v1/models"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = models["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|m| m["id"].as_str())
+        .collect();
+    assert!(
+        ids.contains(&"org/chat:Q4_K_M") && ids.contains(&"org/embed:Q8_0"),
+        "{ids:?}"
+    );
 
     let chat = serde_json::json!({"model": "org/chat:Q4_K_M", "stream": true, "messages": [{"role": "user", "content": "hi"}]});
-    let reply = http.post(format!("{base}/v1/chat/completions")).json(&chat).send().await.unwrap();
+    let reply = http
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&chat)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(reply.status(), 200);
     assert_eq!(reply.headers()["content-type"], "text/event-stream");
     let text = reply.text().await.unwrap();
@@ -388,13 +758,52 @@ async fn openai_endpoint_for_coding_tools() {
 
     let status = |body: serde_json::Value, path: &'static str| {
         let (http, base) = (http.clone(), base.clone());
-        async move { http.post(format!("{base}{path}")).json(&body).send().await.unwrap().status().as_u16() }
+        async move {
+            http.post(format!("{base}{path}"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status()
+                .as_u16()
+        }
     };
-    assert_eq!(status(serde_json::json!({"messages": []}), "/v1/chat/completions").await, 400);
-    assert_eq!(status(serde_json::json!({"model": "org/none:Q4_0", "messages": []}), "/v1/chat/completions").await, 404);
-    assert_eq!(status(serde_json::json!({"model": "org/chat:Q4_K_M", "input": ["x"]}), "/v1/embeddings").await, 400);
-    assert_eq!(status(serde_json::json!({"model": "org/embed:Q8_0", "input": ["x"]}), "/v1/embeddings").await, 200);
-    assert_eq!(http.get(format!("{base}/v1/secret")).send().await.unwrap().status(), 400);
+    assert_eq!(
+        status(serde_json::json!({"messages": []}), "/v1/chat/completions").await,
+        400
+    );
+    assert_eq!(
+        status(
+            serde_json::json!({"model": "org/none:Q4_0", "messages": []}),
+            "/v1/chat/completions"
+        )
+        .await,
+        404
+    );
+    assert_eq!(
+        status(
+            serde_json::json!({"model": "org/chat:Q4_K_M", "input": ["x"]}),
+            "/v1/embeddings"
+        )
+        .await,
+        400
+    );
+    assert_eq!(
+        status(
+            serde_json::json!({"model": "org/embed:Q8_0", "input": ["x"]}),
+            "/v1/embeddings"
+        )
+        .await,
+        200
+    );
+    assert_eq!(
+        http.get(format!("{base}/v1/secret"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        400
+    );
 
     // Without a model, the coding default answers; defaults must fit their role.
     let unnamed = serde_json::json!({"messages": [{"role": "user", "content": "hi"}]});
@@ -408,21 +817,65 @@ async fn openai_endpoint_for_coding_tools() {
         add_model_dirs: None,
         openai: None,
     };
-    let s = h.client.configure_service_with(set("coding", "org/chat:Q4_K_M")).await.unwrap();
+    let s = h
+        .client
+        .configure_service_with(set("coding", "org/chat:Q4_K_M"))
+        .await
+        .unwrap();
     assert_eq!(s.defaults["coding"], "org/chat:Q4_K_M");
     assert_eq!(status(unnamed, "/v1/chat/completions").await, 200);
-    assert_eq!(h.client.configure_service_with(set("embedding", "org/chat:Q4_K_M")).await.unwrap_err().kind, ErrorKind::UnsupportedCapability);
-    assert_eq!(h.client.configure_service_with(set("chat", "org/none:Q4_0")).await.unwrap_err().kind, ErrorKind::UnknownModel);
-    assert_eq!(h.client.configure_service_with(set("lunch", "org/chat:Q4_K_M")).await.unwrap_err().kind, ErrorKind::InvalidRequest);
-    assert!(h.client.configure_service_with(set("coding", "")).await.unwrap().defaults.is_empty());
+    assert_eq!(
+        h.client
+            .configure_service_with(set("embedding", "org/chat:Q4_K_M"))
+            .await
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnsupportedCapability
+    );
+    assert_eq!(
+        h.client
+            .configure_service_with(set("chat", "org/none:Q4_0"))
+            .await
+            .unwrap_err()
+            .kind,
+        ErrorKind::UnknownModel
+    );
+    assert_eq!(
+        h.client
+            .configure_service_with(set("lunch", "org/chat:Q4_K_M"))
+            .await
+            .unwrap_err()
+            .kind,
+        ErrorKind::InvalidRequest
+    );
+    assert!(
+        h.client
+            .configure_service_with(set("coding", ""))
+            .await
+            .unwrap()
+            .defaults
+            .is_empty()
+    );
 
     let slow = serde_json::json!({"model": "org/chat:Q4_K_M", "stream": true, "messages": [{"role": "user", "content": "count:500"}]});
-    let mut reply = http.post(format!("{base}/v1/chat/completions")).json(&slow).send().await.unwrap();
+    let mut reply = http
+        .post(format!("{base}/v1/chat/completions"))
+        .json(&slow)
+        .send()
+        .await
+        .unwrap();
     assert!(reply.chunk().await.unwrap().is_some());
     drop(reply);
     let mut idle = false;
     for _ in 0..50 {
-        if h.client.resource_status().await.unwrap().loaded.iter().all(|m| m.active == 0) {
+        if h.client
+            .resource_status()
+            .await
+            .unwrap()
+            .loaded
+            .iter()
+            .all(|m| m.active == 0)
+        {
             idle = true;
             break;
         }
@@ -436,7 +889,10 @@ async fn openai_endpoint_for_coding_tools() {
 async fn openai_endpoint_is_off_until_turned_on() {
     let h = Harness::start().await;
     let s = h.client.service_settings().await.unwrap();
-    assert!(s.openai_endpoint.is_none() && s.openai_key_file.is_none(), "{s:?}");
+    assert!(
+        s.openai_endpoint.is_none() && s.openai_key_file.is_none(),
+        "{s:?}"
+    );
     let set = |on: bool| Op::ConfigureService {
         max_loaded: None,
         idle_unload_seconds: None,
@@ -449,13 +905,32 @@ async fn openai_endpoint_is_off_until_turned_on() {
     let s = h.client.configure_service_with(set(true)).await.unwrap();
     assert_eq!(s.openai_endpoint.as_deref(), Some("127.0.0.1:8080"));
     let file = s.openai_key_file.expect("key file");
-    assert!(std::fs::read_to_string(&file).unwrap().trim().starts_with("nyx-"));
-    assert!(std::fs::read_to_string(h.paths.config.join("settings.toml")).unwrap().contains("openai_listen = \"127.0.0.1:8080\""));
+    assert!(
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .trim()
+            .starts_with("nyx-")
+    );
+    assert!(
+        std::fs::read_to_string(h.paths.config.join("settings.toml"))
+            .unwrap()
+            .contains("openai_listen = \"127.0.0.1:8080\"")
+    );
     let s = h.client.configure_service_with(set(false)).await.unwrap();
     assert!(s.openai_endpoint.is_none() && s.openai_key_file.is_none());
 
-    let untrusted = Caller { name: "untrusted:x".into(), trusted: false, connection: 0 };
-    assert_eq!(h.service.authorize(&untrusted, &set(true)).unwrap_err().kind, ErrorKind::PermissionDenied);
+    let untrusted = Caller {
+        name: "untrusted:x".into(),
+        trusted: false,
+        connection: 0,
+    };
+    assert_eq!(
+        h.service
+            .authorize(&untrusted, &set(true))
+            .unwrap_err()
+            .kind,
+        ErrorKind::PermissionDenied
+    );
     h.stop().await;
 }
 
@@ -477,7 +952,10 @@ fn revision(paths: &Paths) -> String {
 }
 
 fn power(dir: &Path, mains: bool) {
-    for (name, kind, online) in [("BAT0", "Battery", "0"), ("AC", "Mains", if mains { "1" } else { "0" })] {
+    for (name, kind, online) in [
+        ("BAT0", "Battery", "0"),
+        ("AC", "Mains", if mains { "1" } else { "0" }),
+    ] {
         std::fs::create_dir_all(dir.join(name)).unwrap();
         std::fs::write(dir.join(name).join("type"), kind).unwrap();
         std::fs::write(dir.join(name).join("online"), online).unwrap();
@@ -493,38 +971,90 @@ async fn updates_wait_for_a_free_model_and_for_mains_power() {
     hub.set("a", &[("m-Q4_0.gguf", &v1)]);
     let supply = tempfile::tempdir().unwrap();
     power(supply.path(), false);
-    let h = Harness::start_with("model_updates = \"auto\"\n", Some(endpoint), Some(supply.path().into())).await;
+    let h = Harness::start_with(
+        "model_updates = \"auto\"\n",
+        Some(endpoint),
+        Some(supply.path().into()),
+    )
+    .await;
 
     finish(h.client.download_model("o/r:Q4_0").await).await;
     assert_eq!(revision(&h.paths), "a".repeat(40));
-    assert!(h.client.list_models().await.unwrap().iter().any(|m| m.id == "o/r:Q4_0" && m.has(nyx_ai_client::proto::Capability::Chat)));
+    assert!(
+        h.client
+            .list_models()
+            .await
+            .unwrap()
+            .iter()
+            .any(|m| m.id == "o/r:Q4_0" && m.has(nyx_ai_client::proto::Capability::Chat))
+    );
     assert!(h.client.check_updates().await.unwrap().is_empty());
 
     hub.set("b", &[("m-Q4_0.gguf", &v2)]);
     let found = h.client.check_updates().await.unwrap();
-    assert_eq!(found.iter().map(|m| (m.id.as_str(), m.update_size)).collect::<Vec<_>>(), [("o/r:Q4_0", Some(v2.len() as u64))]);
+    assert_eq!(
+        found
+            .iter()
+            .map(|m| (m.id.as_str(), m.update_size))
+            .collect::<Vec<_>>(),
+        [("o/r:Q4_0", Some(v2.len() as u64))]
+    );
 
     // On battery the updater waits.
     h.service.auto_update();
-    assert!(h.client.downloads().await.unwrap().iter().all(|d| d.model != "o/r:Q4_0" || d.state != nyx_ai_client::proto::DownloadState::Running));
+    assert!(
+        h.client
+            .downloads()
+            .await
+            .unwrap()
+            .iter()
+            .all(|d| d.model != "o/r:Q4_0"
+                || d.state != nyx_ai_client::proto::DownloadState::Running)
+    );
 
     // A chat holds the model; an update fetched meanwhile waits for it.
     let mut chat = h.client.chat(ask("o/r:Q4_0", "count:300")).await.unwrap();
-    while !matches!(chat.next().await.unwrap().unwrap(), Item::Event(Event::Delta { .. })) {}
+    while !matches!(
+        chat.next().await.unwrap().unwrap(),
+        Item::Event(Event::Delta { .. })
+    ) {}
     finish(h.client.download_model("o/r:Q4_0").await).await;
-    assert_eq!(revision(&h.paths), "a".repeat(40), "switched under a running chat");
+    assert_eq!(
+        revision(&h.paths),
+        "a".repeat(40),
+        "switched under a running chat"
+    );
     drop(chat);
     for _ in 0..50 {
-        if h.client.resource_status().await.unwrap().loaded.iter().all(|m| m.active == 0) {
+        if h.client
+            .resource_status()
+            .await
+            .unwrap()
+            .loaded
+            .iter()
+            .all(|m| m.active == 0)
+        {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     h.service.apply_staged().await;
     assert_eq!(revision(&h.paths), "b".repeat(40));
-    let file = h.paths.cache.join("models--o--r/snapshots").join("b".repeat(40)).join("m-Q4_0.gguf");
+    let file = h
+        .paths
+        .cache
+        .join("models--o--r/snapshots")
+        .join("b".repeat(40))
+        .join("m-Q4_0.gguf");
     assert_eq!(std::fs::read(file).unwrap(), v2);
-    assert!(!h.client.list_models().await.unwrap().iter().any(|m| m.update_available));
+    assert!(
+        !h.client
+            .list_models()
+            .await
+            .unwrap()
+            .iter()
+            .any(|m| m.update_available)
+    );
 
     // On mains power and idle, the updater fetches and switches by itself.
     power(supply.path(), true);
@@ -541,7 +1071,9 @@ async fn updates_wait_for_a_free_model_and_for_mains_power() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert!(switched, "the automatic update didn't land");
-    let blobs = std::fs::read_dir(h.paths.cache.join("models--o--r/blobs")).unwrap().count();
+    let blobs = std::fs::read_dir(h.paths.cache.join("models--o--r/blobs"))
+        .unwrap()
+        .count();
     assert_eq!(blobs, 1, "replaced revisions are pruned");
     h.stop().await;
 }
@@ -554,7 +1086,9 @@ async fn raw(socket: &Path, lines: &[String]) -> Vec<ServerLine> {
     }
     let mut reader = BufReader::new(read).lines();
     let mut out = Vec::new();
-    while let Ok(Ok(Some(line))) = tokio::time::timeout(Duration::from_millis(500), reader.next_line()).await {
+    while let Ok(Ok(Some(line))) =
+        tokio::time::timeout(Duration::from_millis(500), reader.next_line()).await
+    {
         out.push(serde_json::from_str(&line).unwrap());
     }
     out
@@ -563,10 +1097,22 @@ async fn raw(socket: &Path, lines: &[String]) -> Vec<ServerLine> {
 #[tokio::test(flavor = "multi_thread")]
 async fn protocol_errors_are_explicit() {
     let h = Harness::start().await;
-    let old = raw(&h.paths.socket, &[encode(&ClientLine::Hello(Hello { api_version: 99, client: "old".into() }))]).await;
-    assert!(matches!(&old[0], ServerLine::Error { error, .. } if error.kind == ErrorKind::IncompatibleVersion));
+    let old = raw(
+        &h.paths.socket,
+        &[encode(&ClientLine::Hello(Hello {
+            api_version: 99,
+            client: "old".into(),
+        }))],
+    )
+    .await;
+    assert!(
+        matches!(&old[0], ServerLine::Error { error, .. } if error.kind == ErrorKind::IncompatibleVersion)
+    );
 
-    let hello = encode(&ClientLine::Hello(Hello { api_version: 1, client: "t".into() }));
+    let hello = encode(&ClientLine::Hello(Hello {
+        api_version: 1,
+        client: "t".into(),
+    }));
     let lines = raw(
         &h.paths.socket,
         &[
@@ -594,7 +1140,9 @@ async fn protocol_errors_are_explicit() {
             (None, ErrorKind::InvalidRequest)
         ]
     );
-    let mode = std::fs::metadata(&h.paths.socket).map(|m| std::os::unix::fs::PermissionsExt::mode(&m.permissions())).unwrap();
+    let mode = std::fs::metadata(&h.paths.socket)
+        .map(|m| std::os::unix::fs::PermissionsExt::mode(&m.permissions()))
+        .unwrap();
     assert_eq!(mode & 0o777, 0o600);
     h.stop().await;
 }
@@ -616,7 +1164,10 @@ fn action(id: &str, side_effects: SideEffects, confirmation: Confirmation) -> Ac
 async fn apps_offer_actions_and_calls_are_checked() {
     use serde_json::json;
     let h = Harness::start().await;
-    let specs = vec![action("notes.find", SideEffects::ReadOnly, Confirmation::Never), action("notes.create", SideEffects::Writes, Confirmation::Ask)];
+    let specs = vec![
+        action("notes.find", SideEffects::ReadOnly, Confirmation::Never),
+        action("notes.create", SideEffects::Writes, Confirmation::Ask),
+    ];
     let mut server = h.client.serve_actions(specs.clone()).await.unwrap();
     let provider = tokio::spawn(async move {
         while let Some(Ok(call)) = server.next().await {
@@ -635,27 +1186,77 @@ async fn apps_offer_actions_and_calls_are_checked() {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    let find = listed.iter().find(|a| a.spec.id == "notes.find").expect("listed");
+    let find = listed
+        .iter()
+        .find(|a| a.spec.id == "notes.find")
+        .expect("listed");
     assert_eq!(find.source, "connection");
     assert_eq!(find.spec.permissions, vec!["notes.read".to_string()]);
 
-    let found = h.client.invoke_action("notes.find", json!({"text": "milk"}), false).await.unwrap();
+    let found = h
+        .client
+        .invoke_action("notes.find", json!({"text": "milk"}), false)
+        .await
+        .unwrap();
     assert_eq!(found["found"], "milk");
     let kind = |r: nyx_ai_client::Result<serde_json::Value>| r.unwrap_err().kind;
-    assert_eq!(kind(h.client.invoke_action("notes.find", json!({"text": 3}), false).await), ErrorKind::InvalidRequest);
-    assert_eq!(kind(h.client.invoke_action("notes.create", json!({"text": "milk"}), false).await), ErrorKind::ConfirmationRequired);
-    let refused = h.client.invoke_action("notes.create", json!({"text": "milk"}), true).await.unwrap_err();
-    assert_eq!((refused.kind, refused.message.as_str()), (ErrorKind::ActionFailed, "the notebook is locked"));
-    assert_eq!(kind(h.client.invoke_action("notes.nothing", json!({}), true).await), ErrorKind::UnknownAction);
+    assert_eq!(
+        kind(
+            h.client
+                .invoke_action("notes.find", json!({"text": 3}), false)
+                .await
+        ),
+        ErrorKind::InvalidRequest
+    );
+    assert_eq!(
+        kind(
+            h.client
+                .invoke_action("notes.create", json!({"text": "milk"}), false)
+                .await
+        ),
+        ErrorKind::ConfirmationRequired
+    );
+    let refused = h
+        .client
+        .invoke_action("notes.create", json!({"text": "milk"}), true)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        (refused.kind, refused.message.as_str()),
+        (ErrorKind::ActionFailed, "the notebook is locked")
+    );
+    assert_eq!(
+        kind(
+            h.client
+                .invoke_action("notes.nothing", json!({}), true)
+                .await
+        ),
+        ErrorKind::UnknownAction
+    );
 
-    let taken = h.client.serve_actions(specs).await.unwrap().next().await.unwrap().unwrap_err();
+    let taken = h
+        .client
+        .serve_actions(specs)
+        .await
+        .unwrap()
+        .next()
+        .await
+        .unwrap()
+        .unwrap_err();
     assert_eq!(taken.kind, ErrorKind::InvalidRequest);
 
     provider.abort();
     let _ = provider.await;
     let mut gone = false;
     for _ in 0..100 {
-        if !h.client.list_actions().await.unwrap().iter().any(|a| a.spec.id == "notes.find") {
+        if !h
+            .client
+            .list_actions()
+            .await
+            .unwrap()
+            .iter()
+            .any(|a| a.spec.id == "notes.find")
+        {
             gone = true;
             break;
         }
@@ -670,23 +1271,52 @@ async fn battery_saver_moves_models_to_the_cpu_on_battery() {
     let power_dir = tempfile::tempdir().unwrap();
     power(power_dir.path(), true);
     let h = Harness::start_with("", None, Some(power_dir.path().to_path_buf())).await;
-    let saver = |on: bool| Op::ConfigureService { max_loaded: None, idle_unload_seconds: None, model_updates: None, defaults: None, battery_saver: Some(on), add_model_dirs: None, openai: None };
-    h.client.chat(ask("org/chat:Q4_K_M", "hi")).await.unwrap().collect_chat().await.unwrap();
+    let saver = |on: bool| Op::ConfigureService {
+        max_loaded: None,
+        idle_unload_seconds: None,
+        model_updates: None,
+        defaults: None,
+        battery_saver: Some(on),
+        add_model_dirs: None,
+        openai: None,
+    };
+    h.client
+        .chat(ask("org/chat:Q4_K_M", "hi"))
+        .await
+        .unwrap()
+        .collect_chat()
+        .await
+        .unwrap();
 
     let s = h.client.configure_service_with(saver(true)).await.unwrap();
     assert!(s.battery_saver && !s.on_battery && !s.cpu_only);
-    assert_eq!(h.client.resource_status().await.unwrap().loaded.len(), 1, "on mains nothing changes");
+    assert_eq!(
+        h.client.resource_status().await.unwrap().loaded.len(),
+        1,
+        "on mains nothing changes"
+    );
 
     power(power_dir.path(), false);
     h.service.apply_power().await;
     let s = h.client.service_settings().await.unwrap();
     assert!(s.on_battery && s.cpu_only);
-    assert!(std::fs::read_to_string(h.paths.router_ini()).unwrap().contains("n-gpu-layers = 0"));
-    assert!(h.client.resource_status().await.unwrap().loaded.is_empty(), "the idle model unloads to come back on the CPU");
+    assert!(
+        std::fs::read_to_string(h.paths.router_ini())
+            .unwrap()
+            .contains("n-gpu-layers = 0")
+    );
+    assert!(
+        h.client.resource_status().await.unwrap().loaded.is_empty(),
+        "the idle model unloads to come back on the CPU"
+    );
 
     power(power_dir.path(), true);
     h.service.apply_power().await;
     assert!(!h.client.service_settings().await.unwrap().cpu_only);
-    assert!(!std::fs::read_to_string(h.paths.router_ini()).unwrap().contains("n-gpu-layers = 0"));
+    assert!(
+        !std::fs::read_to_string(h.paths.router_ini())
+            .unwrap()
+            .contains("n-gpu-layers = 0")
+    );
     h.stop().await;
 }

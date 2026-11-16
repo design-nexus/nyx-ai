@@ -49,7 +49,11 @@ impl Metrics {
 
     pub fn loaded(&self, ms: u64) {
         Metrics::inc(&self.loads);
-        self.averages.lock().expect("averages").load_ms.add(ms as f64);
+        self.averages
+            .lock()
+            .expect("averages")
+            .load_ms
+            .add(ms as f64);
     }
 
     pub fn generated(&self, first_token_ms: u64, tokens_per_second: f64) {

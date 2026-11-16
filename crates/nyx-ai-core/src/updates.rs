@@ -21,9 +21,18 @@ pub struct Update {
 
 /// What `quant` needs to match `tree`: `None` if its files and companions are
 /// already linked in the current snapshot.
-pub fn needed(cache: &Path, repo: &str, current: Option<&str>, tree: &[File], quant: &str, sidecars: &[String]) -> Result<Option<u64>, String> {
+pub fn needed(
+    cache: &Path,
+    repo: &str,
+    current: Option<&str>,
+    tree: &[File],
+    quant: &str,
+    sidecars: &[String],
+) -> Result<Option<u64>, String> {
     let files = selected_files(tree, quant, sidecars)?;
-    let linked = current.map(|r| snapshot_links(cache, repo, r)).unwrap_or_default();
+    let linked = current
+        .map(|r| snapshot_links(cache, repo, r))
+        .unwrap_or_default();
     let blobs = repo_dir(cache, repo).join("blobs");
     let mut missing = false;
     let mut size = 0;
@@ -41,9 +50,17 @@ pub fn needed(cache: &Path, repo: &str, current: Option<&str>, tree: &[File], qu
 
 /// Whether the computer runs on mains power. One without a battery always does.
 pub fn on_ac(power_supply: &Path) -> bool {
-    let read = |dir: &Path, name: &str| std::fs::read_to_string(dir.join(name)).map(|s| s.trim().to_string()).unwrap_or_default();
+    let read = |dir: &Path, name: &str| {
+        std::fs::read_to_string(dir.join(name))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default()
+    };
     let mut battery = false;
-    for entry in std::fs::read_dir(power_supply).into_iter().flatten().flatten() {
+    for entry in std::fs::read_dir(power_supply)
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
         let dir = entry.path();
         match read(&dir, "type").as_str() {
             "Battery" => battery = true,
@@ -65,14 +82,26 @@ pub struct Updates {
 
 impl Updates {
     /// Check `models` (cached `org/repo:QUANT` IDs) against Hugging Face.
-    pub async fn check(&self, cache: &Path, endpoint: &str, token: Option<&str>, sidecars: &[String], models: &[String]) -> BTreeMap<String, Update> {
+    pub async fn check(
+        &self,
+        cache: &Path,
+        endpoint: &str,
+        token: Option<&str>,
+        sidecars: &[String],
+        models: &[String],
+    ) -> BTreeMap<String, Update> {
         let mut by_repo: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
         for model in models {
             if let Ok((repo, quant)) = parse_model(model) {
-                by_repo.entry(repo).or_default().push((model.clone(), quant));
+                by_repo
+                    .entry(repo)
+                    .or_default()
+                    .push((model.clone(), quant));
             }
         }
-        let Ok(client) = downloads::client() else { return BTreeMap::new() };
+        let Ok(client) = downloads::client() else {
+            return BTreeMap::new();
+        };
         let mut found = BTreeMap::new();
         for (repo, models) in by_repo {
             let (sha, tree) = match downloads::latest(&client, endpoint, token, &repo).await {
@@ -89,12 +118,28 @@ impl Updates {
             for (model, quant) in models {
                 match needed(cache, &repo, current.as_deref(), &tree, &quant, sidecars) {
                     Ok(Some(size)) => {
-                        found.insert(model, Update { revision: sha.clone(), size, content: true });
+                        found.insert(
+                            model,
+                            Update {
+                                revision: sha.clone(),
+                                size,
+                                content: true,
+                            },
+                        );
                     }
                     Ok(None) => {
-                        found.insert(model, Update { revision: sha.clone(), size: 0, content: false });
+                        found.insert(
+                            model,
+                            Update {
+                                revision: sha.clone(),
+                                size: 0,
+                                content: false,
+                            },
+                        );
                     }
-                    Err(e) => tracing::debug!(%model, error = %e, "can't compare with the newest revision"),
+                    Err(e) => {
+                        tracing::debug!(%model, error = %e, "can't compare with the newest revision")
+                    }
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
@@ -115,7 +160,10 @@ impl Updates {
     }
 
     pub fn stage(&self, repo: &str, revision: &str) {
-        self.staged.lock().expect("updates").insert(repo.into(), revision.into());
+        self.staged
+            .lock()
+            .expect("updates")
+            .insert(repo.into(), revision.into());
     }
 
     pub fn staged(&self) -> BTreeMap<String, String> {
@@ -129,7 +177,10 @@ impl Updates {
     /// The repository's revision is in use: nothing is pending for its models.
     pub fn switched(&self, repo: &str) {
         self.staged.lock().expect("updates").remove(repo);
-        self.found.lock().expect("updates").retain(|model, _| parse_model(model).is_ok_and(|(r, _)| r != repo));
+        self.found
+            .lock()
+            .expect("updates")
+            .retain(|model, _| parse_model(model).is_ok_and(|(r, _)| r != repo));
     }
 }
 
@@ -150,28 +201,76 @@ mod tests {
         let (q4, q8, mtp) = (gguf_bytes(1, 500), gguf_bytes(2, 500), gguf_bytes(3, 700));
         hub.set("a", &[("m-Q4_0.gguf", &q4), ("m-Q8_0.gguf", &q8)]);
         for model in ["o/r:Q4_0", "o/r:Q8_0"] {
-            let rev = download(cache.path(), &endpoint, None, model, &kinds(&["mtp"]), &progress()).await.unwrap();
+            let rev = download(
+                cache.path(),
+                &endpoint,
+                None,
+                model,
+                &kinds(&["mtp"]),
+                &progress(),
+            )
+            .await
+            .unwrap();
             switch_revision(cache.path(), "o/r", &rev).unwrap();
         }
         let updates = Updates::default();
         let models = ["o/r:Q4_0".to_string(), "o/r:Q8_0".to_string()];
         let sidecars = kinds(&["mtp"]);
-        assert!(updates.check(cache.path(), &endpoint, None, &sidecars, &models).await.is_empty());
+        assert!(
+            updates
+                .check(cache.path(), &endpoint, None, &sidecars, &models)
+                .await
+                .is_empty()
+        );
 
         // A README commit: a new revision, the same files.
         hub.set("b", &[("m-Q4_0.gguf", &q4), ("m-Q8_0.gguf", &q8)]);
-        let found = updates.check(cache.path(), &endpoint, None, &sidecars, &models).await;
-        assert_eq!(found["o/r:Q4_0"], Update { revision: "b".repeat(40), size: 0, content: false });
+        let found = updates
+            .check(cache.path(), &endpoint, None, &sidecars, &models)
+            .await;
+        assert_eq!(
+            found["o/r:Q4_0"],
+            Update {
+                revision: "b".repeat(40),
+                size: 0,
+                content: false
+            }
+        );
 
         // An MTP head for Q4_0 appears; Q8_0 is unchanged.
-        hub.set("c", &[("m-Q4_0.gguf", &q4), ("m-Q8_0.gguf", &q8), ("m-Q4_0-MTP-Q8_0.gguf", &mtp)]);
-        let found = updates.check(cache.path(), &endpoint, None, &sidecars, &models).await;
-        assert_eq!(found["o/r:Q4_0"], Update { revision: "c".repeat(40), size: 708, content: true });
+        hub.set(
+            "c",
+            &[
+                ("m-Q4_0.gguf", &q4),
+                ("m-Q8_0.gguf", &q8),
+                ("m-Q4_0-MTP-Q8_0.gguf", &mtp),
+            ],
+        );
+        let found = updates
+            .check(cache.path(), &endpoint, None, &sidecars, &models)
+            .await;
+        assert_eq!(
+            found["o/r:Q4_0"],
+            Update {
+                revision: "c".repeat(40),
+                size: 708,
+                content: true
+            }
+        );
         assert!(!found["o/r:Q8_0"].content);
-        assert!(updates.check(cache.path(), &endpoint, None, &[], &models).await.values().all(|u| !u.content));
+        assert!(
+            updates
+                .check(cache.path(), &endpoint, None, &[], &models)
+                .await
+                .values()
+                .all(|u| !u.content)
+        );
 
         updates.stage("o/r", &"c".repeat(40));
-        assert!(updates.get("o/r:Q4_0").is_none(), "staged updates aren't offered again");
+        assert!(
+            updates.get("o/r:Q4_0").is_none(),
+            "staged updates aren't offered again"
+        );
         updates.switched("o/r");
         assert!(updates.found().is_empty() && updates.staged().is_empty());
     }

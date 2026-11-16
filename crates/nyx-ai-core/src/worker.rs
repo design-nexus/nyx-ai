@@ -58,7 +58,12 @@ impl Response {
                         return Some(Ok(data));
                     }
                 }
-                Err(e) => return Some(Err(Error::new(ErrorKind::WorkerFailed, format!("llama.cpp stopped answering: {e}")))),
+                Err(e) => {
+                    return Some(Err(Error::new(
+                        ErrorKind::WorkerFailed,
+                        format!("llama.cpp stopped answering: {e}"),
+                    )));
+                }
             }
         }
     }
@@ -68,10 +73,14 @@ impl Response {
         while let Some(chunk) = self.chunk().await {
             body.extend_from_slice(&chunk?);
             if body.len() > MAX_BODY {
-                return Err(Error::new(ErrorKind::WorkerFailed, "llama.cpp reply too large"));
+                return Err(Error::new(
+                    ErrorKind::WorkerFailed,
+                    "llama.cpp reply too large",
+                ));
             }
         }
-        let value: Value = serde_json::from_slice(&body).unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&body).into_owned()));
+        let value: Value = serde_json::from_slice(&body)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&body).into_owned()));
         if (200..300).contains(&self.status) {
             Ok(value)
         } else {
@@ -100,16 +109,32 @@ fn http_error(status: u16, body: &Value) -> Error {
 
 impl Http {
     pub fn new(socket: PathBuf, key: String) -> Http {
-        Http { socket, key: Arc::new(key) }
+        Http {
+            socket,
+            key: Arc::new(key),
+        }
     }
 
-    pub async fn send(&self, method: Method, path: &str, body: Option<&Value>) -> Result<Response, Error> {
-        let stream = UnixStream::connect(&self.socket)
-            .await
-            .map_err(|e| Error::new(ErrorKind::WorkerUnavailable, format!("llama.cpp isn't reachable: {e}")))?;
+    pub async fn send(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Response, Error> {
+        let stream = UnixStream::connect(&self.socket).await.map_err(|e| {
+            Error::new(
+                ErrorKind::WorkerUnavailable,
+                format!("llama.cpp isn't reachable: {e}"),
+            )
+        })?;
         let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
             .await
-            .map_err(|e| Error::new(ErrorKind::WorkerUnavailable, format!("llama.cpp handshake: {e}")))?;
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::WorkerUnavailable,
+                    format!("llama.cpp handshake: {e}"),
+                )
+            })?;
         let task = AbortOnDrop(tokio::spawn(async move {
             let _ = conn.await;
         }));
@@ -125,27 +150,55 @@ impl Http {
             }
             None => Bytes::new(),
         };
-        let request = request.body(Full::new(bytes)).map_err(|e| Error::new(ErrorKind::Internal, e.to_string()))?;
-        let response = sender
-            .send_request(request)
-            .await
-            .map_err(|e| Error::new(ErrorKind::WorkerFailed, format!("llama.cpp dropped the request: {e}")))?;
-        let content_type = response.headers().get("content-type").and_then(|v| v.to_str().ok()).map(String::from);
-        Ok(Response { status: response.status().as_u16(), content_type, body: response.into_body(), _conn: task })
+        let request = request
+            .body(Full::new(bytes))
+            .map_err(|e| Error::new(ErrorKind::Internal, e.to_string()))?;
+        let response = sender.send_request(request).await.map_err(|e| {
+            Error::new(
+                ErrorKind::WorkerFailed,
+                format!("llama.cpp dropped the request: {e}"),
+            )
+        })?;
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+        Ok(Response {
+            status: response.status().as_u16(),
+            content_type,
+            body: response.into_body(),
+            _conn: task,
+        })
     }
 
-    pub async fn json(&self, method: Method, path: &str, body: Option<&Value>, timeout: Duration) -> Result<Value, Error> {
-        tokio::time::timeout(timeout, async { self.send(method, path, body).await?.json().await })
-            .await
-            .map_err(|_| Error::new(ErrorKind::Timeout, format!("llama.cpp didn't answer {path} in time")))?
+    pub async fn json(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+        timeout: Duration,
+    ) -> Result<Value, Error> {
+        tokio::time::timeout(timeout, async {
+            self.send(method, path, body).await?.json().await
+        })
+        .await
+        .map_err(|_| {
+            Error::new(
+                ErrorKind::Timeout,
+                format!("llama.cpp didn't answer {path} in time"),
+            )
+        })?
     }
 
     pub async fn get(&self, path: &str) -> Result<Value, Error> {
-        self.json(Method::GET, path, None, Duration::from_secs(30)).await
+        self.json(Method::GET, path, None, Duration::from_secs(30))
+            .await
     }
 
     pub async fn post(&self, path: &str, body: &Value) -> Result<Value, Error> {
-        self.json(Method::POST, path, Some(body), Duration::from_secs(60)).await
+        self.json(Method::POST, path, Some(body), Duration::from_secs(60))
+            .await
     }
 }
 
@@ -185,7 +238,11 @@ pub fn find_program(configured: Option<&str>, lib: &Path) -> Option<PathBuf> {
     if installed.is_file() {
         return Some(installed);
     }
-    std::env::var_os("PATH")?.to_str()?.split(':').map(|d| Path::new(d).join("llama-server")).find(|p| p.is_file())
+    std::env::var_os("PATH")?
+        .to_str()?
+        .split(':')
+        .map(|d| Path::new(d).join("llama-server"))
+        .find(|p| p.is_file())
 }
 
 /// The release tag `install-llama.sh` wrote next to the build.
@@ -233,11 +290,18 @@ impl Worker {
     pub fn new(config: Config) -> Arc<Worker> {
         let key = random_key();
         let http = Http::new(config.socket.clone(), key);
-        let state = if config.program.is_some() { WorkerState::Stopped } else { WorkerState::Missing };
+        let state = if config.program.is_some() {
+            WorkerState::Stopped
+        } else {
+            WorkerState::Missing
+        };
         Arc::new(Worker {
             config,
             http,
-            inner: Mutex::new(Inner { state: Some(state), ..Default::default() }),
+            inner: Mutex::new(Inner {
+                state: Some(state),
+                ..Default::default()
+            }),
             generation: AtomicU64::new(0),
             changed: watch::channel(0).0,
             start_lock: tokio::sync::Mutex::new(()),
@@ -273,14 +337,20 @@ impl Worker {
     pub fn load_error(&self) -> Option<String> {
         let inner = self.inner.lock().expect("worker state");
         let newest = |needle: &str| inner.errors.iter().rev().find(|l| l.contains(needle));
-        newest("error loading model").or_else(|| newest("failed to load")).map(|l| {
-            let text = l.split_once(" E ").map_or(l.as_str(), |(_, rest)| rest);
-            text.trim().to_string()
-        })
+        newest("error loading model")
+            .or_else(|| newest("failed to load"))
+            .map(|l| {
+                let text = l.split_once(" E ").map_or(l.as_str(), |(_, rest)| rest);
+                text.trim().to_string()
+            })
     }
 
     fn state(&self) -> WorkerState {
-        self.inner.lock().expect("worker state").state.unwrap_or(WorkerState::Stopped)
+        self.inner
+            .lock()
+            .expect("worker state")
+            .state
+            .unwrap_or(WorkerState::Stopped)
     }
 
     fn set_state(&self, state: WorkerState) {
@@ -294,7 +364,10 @@ impl Worker {
         let mut changes = self.subscribe();
         loop {
             if self.shutting_down.load(Ordering::SeqCst) {
-                return Err(Error::new(ErrorKind::WorkerUnavailable, "Nyx AI Core is shutting down"));
+                return Err(Error::new(
+                    ErrorKind::WorkerUnavailable,
+                    "Nyx AI Core is shutting down",
+                ));
             }
             match self.state() {
                 WorkerState::Ready => return Ok(self.http.clone()),
@@ -307,12 +380,21 @@ impl Worker {
                 WorkerState::Failed => {
                     let (recent, error) = {
                         let inner = self.inner.lock().expect("worker state");
-                        (inner.crashes.back().is_some_and(|t| t.elapsed() < FAILED_PAUSE), inner.last_error.clone())
+                        (
+                            inner
+                                .crashes
+                                .back()
+                                .is_some_and(|t| t.elapsed() < FAILED_PAUSE),
+                            inner.last_error.clone(),
+                        )
                     };
                     if recent {
                         return Err(Error::new(
                             ErrorKind::WorkerFailed,
-                            format!("llama.cpp keeps crashing: {}", error.unwrap_or_else(|| "no error message".into())),
+                            format!(
+                                "llama.cpp keeps crashing: {}",
+                                error.unwrap_or_else(|| "no error message".into())
+                            ),
                         ));
                     }
                     self.inner.lock().expect("worker state").crashes.clear();
@@ -322,9 +404,16 @@ impl Worker {
                 WorkerState::Starting | WorkerState::Restarting => {
                     let left = deadline.saturating_duration_since(Instant::now());
                     if left.is_zero() {
-                        return Err(Error::new(ErrorKind::Timeout, "llama.cpp took too long to start"));
+                        return Err(Error::new(
+                            ErrorKind::Timeout,
+                            "llama.cpp took too long to start",
+                        ));
                     }
-                    let _ = tokio::time::timeout(left.min(Duration::from_millis(500)), changes.changed()).await;
+                    let _ = tokio::time::timeout(
+                        left.min(Duration::from_millis(500)),
+                        changes.changed(),
+                    )
+                    .await;
                 }
             }
         }
@@ -335,7 +424,10 @@ impl Worker {
         if matches!(self.state(), WorkerState::Ready | WorkerState::Starting) {
             return Ok(());
         }
-        let program = self.config.program.clone().ok_or_else(|| Error::new(ErrorKind::WorkerUnavailable, "llama.cpp isn't installed"))?;
+        let program =
+            self.config.program.clone().ok_or_else(|| {
+                Error::new(ErrorKind::WorkerUnavailable, "llama.cpp isn't installed")
+            })?;
         self.set_state(WorkerState::Starting);
         let spawn = {
             let mut inner = self.inner.lock().expect("worker state");
@@ -362,9 +454,14 @@ impl Worker {
         loop {
             if self.state() != WorkerState::Starting {
                 let error = self.inner.lock().expect("worker state").last_error.clone();
-                return Err(Error::new(ErrorKind::WorkerFailed, error.unwrap_or_else(|| "llama.cpp exited while starting".into())));
+                return Err(Error::new(
+                    ErrorKind::WorkerFailed,
+                    error.unwrap_or_else(|| "llama.cpp exited while starting".into()),
+                ));
             }
-            if let Ok(Ok(_)) = tokio::time::timeout(Duration::from_secs(2), self.http.get("/health")).await {
+            if let Ok(Ok(_)) =
+                tokio::time::timeout(Duration::from_secs(2), self.http.get("/health")).await
+            {
                 break;
             }
             if started.elapsed() > START_TIMEOUT {
@@ -390,7 +487,10 @@ impl Worker {
         std::fs::create_dir_all(self.config.socket.parent().unwrap_or(Path::new("/tmp")))?;
         let _ = std::fs::remove_file(&self.config.socket);
         crate::paths::write_atomic(&self.config.key_file, self.http.key.as_bytes())?;
-        std::fs::set_permissions(&self.config.key_file, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::set_permissions(
+            &self.config.key_file,
+            std::fs::Permissions::from_mode(0o600),
+        )?;
         let mut cmd = tokio::process::Command::new(program);
         cmd.arg("--host")
             .arg(&self.config.socket)
@@ -398,7 +498,13 @@ impl Worker {
             .arg(&self.config.key_file)
             .arg("--models-preset")
             .arg(&self.config.preset)
-            .args(["--models-max", &self.config.max_models.to_string(), "--no-models-autoload", "--jinja", "--no-webui"])
+            .args([
+                "--models-max",
+                &self.config.max_models.to_string(),
+                "--no-models-autoload",
+                "--jinja",
+                "--no-webui",
+            ])
             .env("LLAMA_CACHE", &self.config.cache)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -431,13 +537,25 @@ impl Worker {
         cmd.spawn()
     }
 
-    fn watch(self: Arc<Self>, child: tokio::process::Child, spawn: u64) -> futures_util::future::BoxFuture<'static, ()> {
+    fn watch(
+        self: Arc<Self>,
+        child: tokio::process::Child,
+        spawn: u64,
+    ) -> futures_util::future::BoxFuture<'static, ()> {
         Box::pin(self.watch_inner(child, spawn))
     }
 
     async fn watch_inner(self: Arc<Self>, mut child: tokio::process::Child, spawn: u64) {
-        for pipe in [child.stdout.take().map(|p| Box::new(p) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
-            child.stderr.take().map(|p| Box::new(p) as Box<dyn tokio::io::AsyncRead + Send + Unpin>)]
+        for pipe in [
+            child
+                .stdout
+                .take()
+                .map(|p| Box::new(p) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
+            child
+                .stderr
+                .take()
+                .map(|p| Box::new(p) as Box<dyn tokio::io::AsyncRead + Send + Unpin>),
+        ]
         .into_iter()
         .flatten()
         {
@@ -447,7 +565,10 @@ impl Worker {
                 while let Ok(Some(line)) = lines.next_line().await {
                     tracing::debug!(target: "llama", "{line}");
                     let lower = line.to_ascii_lowercase();
-                    if lower.contains("error") || lower.contains("failed") || lower.contains("abort") {
+                    if lower.contains("error")
+                        || lower.contains("failed")
+                        || lower.contains("abort")
+                    {
                         let mut inner = me.inner.lock().expect("worker state");
                         inner.errors.push_back(line.chars().take(240).collect());
                         if inner.errors.len() > 20 {
@@ -466,18 +587,28 @@ impl Worker {
             self.set_state(WorkerState::Stopped);
             return;
         }
-        let code = status.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
+        let code = status
+            .map(|s| s.to_string())
+            .unwrap_or_else(|e| e.to_string());
         let (state, delay) = {
             let mut inner = self.inner.lock().expect("worker state");
             inner.pid = None;
             inner.started = None;
             let now = Instant::now();
             inner.crashes.push_back(now);
-            while inner.crashes.front().is_some_and(|t| now.duration_since(*t) > CRASH_WINDOW) {
+            while inner
+                .crashes
+                .front()
+                .is_some_and(|t| now.duration_since(*t) > CRASH_WINDOW)
+            {
                 inner.crashes.pop_front();
             }
             let detail = inner.errors.back().cloned().unwrap_or_default();
-            inner.last_error = Some(if detail.is_empty() { format!("llama.cpp exited ({code})") } else { format!("llama.cpp exited ({code}): {detail}") });
+            inner.last_error = Some(if detail.is_empty() {
+                format!("llama.cpp exited ({code})")
+            } else {
+                format!("llama.cpp exited ({code}): {detail}")
+            });
             let crashes = inner.crashes.len();
             if crashes >= CRASH_LIMIT {
                 inner.state = Some(WorkerState::Failed);
@@ -485,14 +616,18 @@ impl Worker {
             } else {
                 inner.restarts += 1;
                 inner.state = Some(WorkerState::Restarting);
-                (WorkerState::Restarting, Duration::from_secs(1 << (crashes - 1).min(4)))
+                (
+                    WorkerState::Restarting,
+                    Duration::from_secs(1 << (crashes - 1).min(4)),
+                )
             }
         };
         self.changed.send_modify(|n| *n += 1);
         tracing::warn!(%code, ?state, "llama.cpp worker exited");
         if state == WorkerState::Restarting {
             tokio::time::sleep(delay).await;
-            if self.state() == WorkerState::Restarting && !self.shutting_down.load(Ordering::SeqCst) {
+            if self.state() == WorkerState::Restarting && !self.shutting_down.load(Ordering::SeqCst)
+            {
                 self.set_state(WorkerState::Stopped);
                 if let Err(e) = self.start().await {
                     tracing::warn!(error = %e, "llama.cpp worker didn't restart");
@@ -520,7 +655,9 @@ impl Worker {
                 libc::kill(-(pid as i32), libc::SIGTERM);
             }
             for _ in 0..50 {
-                if self.inner.lock().expect("worker state").pid.is_none() || self.state() == WorkerState::Stopped {
+                if self.inner.lock().expect("worker state").pid.is_none()
+                    || self.state() == WorkerState::Stopped
+                {
                     break;
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -547,10 +684,16 @@ mod tests {
 
     #[test]
     fn errors_from_llama_replies() {
-        let e = http_error(404, &serde_json::json!({"error": {"code": 404, "message": "model not found"}}));
+        let e = http_error(
+            404,
+            &serde_json::json!({"error": {"code": 404, "message": "model not found"}}),
+        );
         assert_eq!(e.kind, ErrorKind::UnknownModel);
         assert_eq!(e.message, "llama.cpp: model not found");
-        assert_eq!(http_error(500, &Value::String("boom".into())).kind, ErrorKind::WorkerFailed);
+        assert_eq!(
+            http_error(500, &Value::String("boom".into())).kind,
+            ErrorKind::WorkerFailed
+        );
         assert_eq!(encode_query("org/m:Q4_K_M"), "org%2Fm%3AQ4_K_M");
         assert_eq!(random_key().len(), 64);
     }
