@@ -212,6 +212,8 @@ fn action(spec: &ActionSpec) -> nyx_actions::Action {
         timeout_ms: spec.timeout_ms,
         suggest: Default::default(),
         result: None,
+        sensitive: false,
+        icon: String::new(),
     }
 }
 
