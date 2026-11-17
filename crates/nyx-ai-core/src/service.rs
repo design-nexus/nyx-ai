@@ -1506,6 +1506,11 @@ impl Service {
 
     /// Pass one OpenAI-style request to the worker under a lease on its model,
     /// which loads it if needed. The lease lives as long as the reply is read.
+    /// A forwarded request's timings, from the worker's reply (`openai.rs`).
+    pub fn forwarded(&self, prompt_ms: f64, per_second: f64) {
+        self.metrics.generated(prompt_ms as u64, per_second);
+    }
+
     pub async fn forward(
         &self,
         path: &str,

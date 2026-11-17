@@ -176,6 +176,8 @@ async fn handle(
         .clone()
         .unwrap_or_else(|| "application/json".into());
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(16);
+    let mut timings = Timings::new(&content_type);
+    let recorder = service.clone();
     tokio::spawn(async move {
         let _lease = lease;
         loop {
@@ -186,12 +188,18 @@ async fn handle(
             };
             match chunk {
                 Some(Ok(bytes)) => {
+                    timings.push(&bytes);
                     if tx.send(bytes).await.is_err() {
                         break;
                     }
                 }
                 _ => break,
             }
+        }
+        // The worker's own timings, as for requests made through AI Core's socket, so
+        // `nyx-ai status` counts these too.
+        if let Some((prompt_ms, per_second)) = timings.finish() {
+            recorder.forwarded(prompt_ms, per_second);
         }
     });
     let stream = futures_util::stream::unfold(rx, |mut rx| async move {
@@ -207,6 +215,54 @@ async fn handle(
 }
 
 /// Serve until `stop` is cancelled. Only loopback peers are answered.
+/// llama.cpp's `timings` in a forwarded reply: in the stream's events, or in the one
+/// JSON reply (kept up to `MAX_LINE`; a longer one isn't timed).
+enum Timings {
+    Stream(crate::stream::Sse),
+    Json(Vec<u8>),
+    Skip,
+}
+
+impl Timings {
+    fn new(content_type: &str) -> Self {
+        if content_type.starts_with("text/event-stream") {
+            Self::Stream(crate::stream::Sse::default())
+        } else {
+            Self::Json(Vec::new())
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) {
+        match self {
+            Self::Stream(sse) => {
+                sse.push(chunk);
+            }
+            Self::Json(body) if body.len() + chunk.len() <= MAX_LINE => {
+                body.extend_from_slice(chunk)
+            }
+            Self::Json(_) => *self = Self::Skip,
+            Self::Skip => {}
+        }
+    }
+
+    fn finish(self) -> Option<(f64, f64)> {
+        match self {
+            Self::Stream(sse) => sse.timings,
+            Self::Json(body) => {
+                let value: Value = serde_json::from_slice(&body).ok()?;
+                let t = value["timings"].as_object()?;
+                Some((
+                    t.get("prompt_ms").and_then(Value::as_f64).unwrap_or(0.0),
+                    t.get("predicted_per_second")
+                        .and_then(Value::as_f64)
+                        .unwrap_or(0.0),
+                ))
+            }
+            Self::Skip => None,
+        }
+    }
+}
+
 pub async fn serve(
     service: Arc<Service>,
     listener: std::net::TcpListener,
@@ -247,5 +303,37 @@ pub async fn serve(
                 .serve_connection(TokioIo::new(stream), svc)
                 .await;
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn forwarded_stream_timings_are_read() {
+        let mut t = Timings::new("text/event-stream; charset=utf-8");
+        t.push(b"data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_");
+        t.push(b"reason\":\"stop\"}],\"timings\":{\"prompt_ms\":21.5,\"predicted_per_second\":33.0}}\n\ndata: [DONE]\n\n");
+        assert_eq!(t.finish(), Some((21.5, 33.0)));
+    }
+
+    #[test]
+    fn forwarded_json_timings_are_read() {
+        let mut t = Timings::new("application/json");
+        t.push(b"{\"choices\":[],\"timings\":{\"prompt_ms\":");
+        t.push(b"8.0,\"predicted_per_second\":50.5}}");
+        assert_eq!(t.finish(), Some((8.0, 50.5)));
+    }
+
+    #[test]
+    fn replies_without_timings_or_too_long_record_nothing() {
+        let mut t = Timings::new("application/json");
+        t.push(b"{\"data\":[]}");
+        assert_eq!(t.finish(), None);
+        let mut t = Timings::new("application/json");
+        t.push(&vec![b' '; MAX_LINE]);
+        t.push(b"{\"timings\":{\"prompt_ms\":1.0}}");
+        assert_eq!(t.finish(), None);
     }
 }
