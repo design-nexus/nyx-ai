@@ -6,6 +6,8 @@ holds load-time settings, budgets memory, schedules requests and loads and
 unloads models. Apps keep their own conversations, prompts and indexes and talk
 to it through `nyx-ai-client`.
 
+On NyxOS, AI Core comes with the system. Elsewhere, from a checkout:
+
 ```sh
 ./install.sh            # build, install, enable the socket (starts on first use)
 nyx-ai status           # worker, memory, loaded models
